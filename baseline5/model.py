@@ -38,8 +38,10 @@ class ConditionalCSDI(CSDI_base):
         del self.alpha_torch
         self.register_buffer("alpha_torch", alpha_torch)
 
-    def _apply(self, fn, recurse=True):
-        result = super()._apply(fn, recurse=recurse)
+    def _apply(self, fn, *args, **kwargs):
+        # Do not inject recurse=: older PyTorch only accepts fn. Forward any
+        # extra arguments only when the installed PyTorch explicitly supplies them.
+        result = super()._apply(fn, *args, **kwargs)
         self.device = self.embed_layer.weight.device
         return result
 

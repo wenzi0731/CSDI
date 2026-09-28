@@ -44,6 +44,27 @@ def tiny_config(tmp_path):
     return config
 
 
+def test_device_move_with_legacy_apply_signature(tiny_config, monkeypatch):
+    model = ConditionalCSDI(tiny_config, 18)
+    original_apply = torch.nn.Module._apply
+
+    # Older PyTorch Module._apply accepts only fn, not recurse=.
+    def legacy_apply(module, fn):
+        return original_apply(module, fn)
+
+    monkeypatch.setattr(torch.nn.Module, "_apply", legacy_apply)
+    assert model.to("cpu") is model
+    assert model.device == model.embed_layer.weight.device == torch.device("cpu")
+    assert model.alpha_torch.device == model.device
+    model.to(dtype=torch.float64)
+    assert model.alpha_torch.dtype == model.embed_layer.weight.dtype == torch.float64
+    model.float().eval()
+    cond, year, target = torch.randn(2, 18, 24), torch.randn(2, 1, 24), torch.randn(2, 4, 24)
+    assert torch.isfinite(model(target, cond, year))
+    samples = generate_scenarios(model, cond, year, 2, torch.Generator().manual_seed(42), 4)
+    assert samples.shape == (2, 2, 4, 24) and torch.isfinite(samples).all()
+
+
 def test_exact_upstream_loss_and_sampler_parity(tiny_config):
     model = ConditionalCSDI(tiny_config, 18).eval()
     upstream = CSDI_base(23, deepcopy(tiny_config), torch.device("cpu")).eval()
