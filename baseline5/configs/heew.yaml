@@ -1,0 +1,43 @@
+run:
+  name: csdi_joint
+  seed: 42
+  device: auto
+  output_root: experiments/baseline5
+data:
+  energy_path: Data/CN03_energy_cleaned.csv
+  weather_path: Data/weather_cleaned.csv
+  weather_feature_set: pv10
+  seq_len: 24
+  num_workers: 0
+model:
+  is_unconditional: 0
+  timeemb: 128
+  featureemb: 16
+  target_strategy: fixed_exogenous
+diffusion:
+  layers: 4
+  channels: 64
+  nheads: 8
+  diffusion_embedding_dim: 128
+  beta_start: 0.0001
+  beta_end: 0.5
+  num_steps: 50
+  schedule: quad
+  is_linear: false
+training:
+  epochs: 300
+  batch_size: 16
+  learning_rate: 0.001
+  betas: [0.9, 0.999]
+  weight_decay: 0.000001
+  gradient_clip: 1.0
+  ema_decay: 0.0  # 0 means exact current weights, no EMA smoothing
+  val_every: 5
+  early_stopping_patience: 12
+evaluation:
+  batch_size: 8
+  sample_chunk_size: 32
+  val_scenarios: 20
+  test_scenarios: 100
+  precision_recall_k: 5
+  max_precision_samples: 10000

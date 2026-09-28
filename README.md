@@ -1,4 +1,8 @@
 # CSDI
+## HEEW baseline 5
+
+Condition-only joint Electricity/Heat/Cooling/PV generation, a fixed six-configuration search, and R²/IS/ES/VS evaluation: [中文运行说明](README_BASELINE5.md).
+
 This is the github repository for the NeurIPS 2021 paper "[CSDI: Conditional Score-based Diffusion Models for Probabilistic Time Series Imputation](https://arxiv.org/abs/2107.03502)".
 
 ## Requirement

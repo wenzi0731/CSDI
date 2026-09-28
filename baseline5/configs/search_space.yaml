@@ -1,0 +1,14 @@
+# Preregistered 3 widths x 2 learning rates. All other settings are fixed.
+configurations:
+  - id: c01_w64_lr1e3
+    overrides: {diffusion.channels: 64, training.learning_rate: 0.001}
+  - id: c02_w64_lr1e4
+    overrides: {diffusion.channels: 64, training.learning_rate: 0.0001}
+  - id: c03_w96_lr1e3
+    overrides: {diffusion.channels: 96, training.learning_rate: 0.001}
+  - id: c04_w96_lr1e4
+    overrides: {diffusion.channels: 96, training.learning_rate: 0.0001}
+  - id: c05_w128_lr1e3
+    overrides: {diffusion.channels: 128, training.learning_rate: 0.001}
+  - id: c06_w128_lr1e4
+    overrides: {diffusion.channels: 128, training.learning_rate: 0.0001}
