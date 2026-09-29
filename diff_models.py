@@ -85,7 +85,7 @@ class diff_CSDI(nn.Module):
             ]
         )
 
-    def forward(self, x, cond_info, diffusion_step):
+    def forward(self, x, cond_info, diffusion_step, return_hidden=False):
         B, inputdim, K, L = x.shape
 
         x = x.reshape(B, inputdim, K * L)
@@ -104,8 +104,11 @@ class diff_CSDI(nn.Module):
         x = x.reshape(B, self.channels, K * L)
         x = self.output_projection1(x)  # (B,channel,K*L)
         x = F.relu(x)
+        hidden = x.reshape(B, self.channels, K, L)
         x = self.output_projection2(x)  # (B,1,K*L)
         x = x.reshape(B, K, L)
+        if return_hidden:
+            return x, hidden
         return x
 
 

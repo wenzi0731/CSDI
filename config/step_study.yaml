@@ -1,12 +1,15 @@
 data:
   task: daily_exogenous
   seq_len: 24
-  weather_feature_set: pv11
-  train_fraction: 0.8
-  val_fraction: 0.1
+  weather_feature_set: pv10
+  train_years: [2014, 2015, 2016, 2017, 2018, 2019, 2020]
+  val_years: [2021]
+  test_years: [2022]
+  residual_normalization: train_residual
 dlinear:
   kernel: 5
   individual: true
+  pv_year_film_scale: 0.20
 train:
   batch_size: 16
   dlinear_epochs: 50
@@ -24,6 +27,7 @@ diffusion:
   is_linear: false
 model:
   condition_on_skeleton: true
+  pv_year_film_scale: 0.20
   is_unconditional: false
   timeemb: 128
   featureemb: 16

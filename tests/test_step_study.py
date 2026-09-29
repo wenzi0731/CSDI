@@ -137,15 +137,18 @@ class StepStudyTests(unittest.TestCase):
         class ZeroForecast:
             num_steps = 2
 
-            def pack_conditions(self, conditions, skeleton=None):
+            def pack_conditions(self, conditions, skeleton=None, pv_year=None):
                 return conditions
+
+            def reconstruct(self, samples, skeleton):
+                return samples + skeleton[:, None]
 
             def sample_ddpm(self, history, initial_noise, generator):
                 return torch.zeros_like(initial_noise)
 
-        dataset = torch.utils.data.TensorDataset(torch.zeros(3, 12, 4), torch.full((3, 4, 4), 2.))
+        dataset = torch.utils.data.TensorDataset(torch.zeros(3, 12, 4), torch.full((3, 4, 4), 2.), torch.zeros(3, 12, 1))
         models = {"direct": ZeroForecast(), "residual": ZeroForecast()}
-        baseline = lambda history: history.new_zeros(len(history), 4, 4)
+        baseline = lambda history, year: history.new_zeros(len(history), 4, 4)
         with patch("builtins.print"):
             rows, _ = evaluate(models, baseline, {"val": dataset, "test": dataset},
                 {"samples": 3, "batch_size": 2}, {"scale": [3.]*4, "mean": [10.]*4},
@@ -154,7 +157,7 @@ class StepStudyTests(unittest.TestCase):
         for row in rows:
             self.assertEqual(row["crps_original"], 6.)
             self.assertEqual(row["ncrps_denominator_mean_abs_target"], 16.)
-            self.assertEqual(row["ncrps"], .375)
+            self.assertAlmostEqual(row["ncrps"], .375)
             self.assertEqual(row["diffusion_steps"], row["sampling_steps"])
 
     def test_four_variable_selection_and_plot_grid_validation(self):

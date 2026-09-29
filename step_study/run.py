@@ -50,20 +50,20 @@ def fit(model, datasets, config, device, seed, path, baseline=None, stage1=False
     optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"])
     epochs = config["dlinear_epochs" if stage1 else "diffusion_epochs"]
     best, log = float("inf"), []
-    def objective(conditions, truth):
+    def objective(conditions, truth, pv_year):
         if stage1:
-            return torch.nn.functional.mse_loss(model(conditions), truth)
+            return torch.nn.functional.mse_loss(model(conditions, pv_year), truth)
         with torch.no_grad():
-            skeleton = None if baseline is None else baseline(conditions)
-            target = truth if skeleton is None else truth - skeleton
-        return model.loss(model.pack_conditions(conditions, skeleton), target)
+            skeleton = None if baseline is None else baseline(conditions, pv_year)
+            target = truth if skeleton is None else model.normalize_residual(truth, skeleton)
+        return model.loss(model.pack_conditions(conditions, skeleton, pv_year), target)
     for epoch in range(epochs):
         model.train()
         train_sum, seen = 0., 0
-        for conditions, truth in train:
-            conditions, truth = conditions.to(device), truth.to(device)
+        for conditions, truth, pv_year in train:
+            conditions, truth, pv_year = conditions.to(device), truth.to(device), pv_year.to(device)
             optimizer.zero_grad(set_to_none=True)
-            loss = objective(conditions, truth)
+            loss = objective(conditions, truth, pv_year)
             if not torch.isfinite(loss):
                 raise RuntimeError("Nonfinite training loss")
             loss.backward()
@@ -77,8 +77,8 @@ def fit(model, datasets, config, device, seed, path, baseline=None, stage1=False
         devices = [torch.device(device).index or 0] if str(device).startswith("cuda") else []
         with torch.random.fork_rng(devices=devices), torch.no_grad():
             torch.manual_seed(seed + 10000)
-            for conditions, truth in valid:
-                val_sum += objective(conditions.to(device), truth.to(device)).item() * len(conditions)
+            for conditions, truth, pv_year in valid:
+                val_sum += objective(conditions.to(device), truth.to(device), pv_year.to(device)).item() * len(conditions)
         val_loss = val_sum / len(datasets["val"])
         if not np.isfinite(val_loss):
             raise RuntimeError("Nonfinite validation loss")
@@ -109,18 +109,18 @@ def evaluate(models, baseline, datasets, config, scaler, names, device, seed):
             sums = torch.zeros(len(names), device=device, dtype=torch.float64)
             squares, denominator = torch.zeros_like(sums), torch.zeros_like(sums)
             es_sum, count, windows, elapsed = 0., 0, 0, 0.
-            for conditions, truth in loader:
-                conditions, truth = conditions.to(device), truth.to(device)
+            for conditions, truth, pv_year in loader:
+                conditions, truth, pv_year = conditions.to(device), truth.to(device), pv_year.to(device)
                 noise = torch.randn((len(conditions), config["samples"], *truth.shape[1:]),
                                     generator=generator).to(device)
                 if str(device).startswith("cuda"):
                     torch.cuda.synchronize()
                 start = time.perf_counter()
-                skeleton = baseline(conditions) if method == "residual" else None
-                packed = model.pack_conditions(conditions, skeleton)
+                skeleton = baseline(conditions, pv_year) if method == "residual" else None
+                packed = model.pack_conditions(conditions, skeleton, pv_year)
                 samples = model.sample_ddpm(packed, noise, reverse_generator)
                 if skeleton is not None:
-                    samples = samples + skeleton[:, None]
+                    samples = model.reconstruct(samples, skeleton)
                 if str(device).startswith("cuda"):
                     torch.cuda.synchronize()
                 elapsed += time.perf_counter() - start
@@ -132,7 +132,7 @@ def evaluate(models, baseline, datasets, config, scaler, names, device, seed):
                 es_sum += energy_score(samples, truth).sum().item()
                 windows += len(conditions)
                 count += len(conditions) * truth.shape[1]
-            normalized = ncrps_from_sums(sums * scale, denominator)
+            normalized = ncrps_from_sums(sums * scale, denominator, epsilon=1e-8)
             for i, name in enumerate(names):
                 rows.append({"seed": seed, "split": split, "method": method,
                              "diffusion_steps": steps, "sampling_steps": steps, "sampler": "DDPM",
@@ -152,8 +152,8 @@ def evaluate(models, baseline, datasets, config, scaler, names, device, seed):
 @torch.no_grad()
 def residual_diagnostics(baseline, dataset, batch_size, device, names):
     targets, residuals = [], []
-    for conditions, truth in DataLoader(dataset, batch_size=batch_size):
-        mu = baseline(conditions.to(device)).cpu()
+    for conditions, truth, pv_year in DataLoader(dataset, batch_size=batch_size):
+        mu = baseline(conditions.to(device), pv_year.to(device)).cpu()
         targets.append(truth)
         residuals.append(truth - mu)
     target, residual = torch.cat(targets).flatten(0, 1), torch.cat(residuals).flatten(0, 1)
@@ -163,18 +163,45 @@ def residual_diagnostics(baseline, dataset, batch_size, device, names):
             for i, name in enumerate(names)]
 
 
+@torch.no_grad()
+def fit_residual_scaler(baseline, train_dataset, energy_scale, batch_size, device,
+                        mode="train_residual"):
+    """Fit physical residual mean/sample std on training days only.
+
+    Buffers use target-standardized units for common physical-unit evaluation.
+    `target_scale` disables residual re-standardization for a controlled ablation.
+    """
+    scale = torch.tensor(energy_scale, dtype=torch.float32)
+    if mode == "target_scale":
+        center, spread = torch.zeros_like(scale), scale.clone()
+    elif mode == "train_residual":
+        residuals = []
+        for conditions, truth, year in DataLoader(train_dataset, batch_size=batch_size):
+            mu = baseline(conditions.to(device), year.to(device)).cpu()
+            residuals.append(((truth - mu) * scale).reshape(-1, len(scale)))
+        residuals = torch.cat(residuals)
+        center, spread = residuals.mean(0), residuals.std(0, unbiased=True) + 1e-6
+    else:
+        raise ValueError("residual_normalization must be train_residual or target_scale")
+    if not torch.isfinite(center).all() or not torch.isfinite(spread).all() or (spread <= 0).any():
+        raise ValueError("Invalid training residual statistics")
+    return {"mode": mode, "center_physical": center.tolist(), "scale_physical": spread.tolist(),
+            "center_target_units": (center/scale).tolist(), "scale_target_units": (spread/scale).tolist(),
+            "training_days": len(train_dataset)}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="config/step_study.yaml")
     source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--energy-path", help="Total_energy.csv with Year/Month/Day/Hour and Electricity/Heat/Cooling/PV")
+    source.add_argument("--energy-path", help="CN03_energy_cleaned.csv with Year/Month/Day/Hour and Electricity/Heat/Cooling/PV")
     source.add_argument("--synthetic", action="store_true", help="Pipeline demonstration only")
-    parser.add_argument("--weather-path", help="Total_weather.csv aligned by Year/Month/Day/Hour (required with --energy-path)")
+    parser.add_argument("--weather-path", help="weather_cleaned.csv aligned by Year/Month/Day/Hour (required with --energy-path)")
     parser.add_argument("--plot-variables", help="Optional display order for Electricity,Heat,Cooling,PV")
     parser.add_argument("--diffusion-steps", nargs="+", type=int, help="Total training/ancestral DDPM steps; train a fresh pair for each T")
     parser.add_argument("--output", required=True, help="New, empty run directory")
     parser.add_argument("--device", default="cpu", help="cpu or cuda:N")
-    parser.add_argument("--seeds", nargs="+", type=int, default=[42, 43, 44])
+    parser.add_argument("--seeds", nargs="+", type=int, default=[42])
     parser.add_argument("--smoke", action="store_true", help="Small model/one epoch; not scientific evidence")
     parser.add_argument("--evaluate-only", action="store_true", help="Reuse checkpoints in --output, no retraining")
     parser.add_argument("--threads", type=int, default=1)
@@ -191,6 +218,10 @@ def main():
     config = yaml.safe_load(Path(args.config).read_text())
     if config["data"].get("task") != "daily_exogenous" or config["data"].get("seq_len") != 24:
         raise ValueError("Use the paper's daily_exogenous configuration with seq_len=24; history forecasts are not this task")
+    if "train_fraction" in config["data"] or "train_years" not in config["data"]:
+        raise ValueError("Use the current paper config with fixed natural-year splits, not the old 80/10/10 config")
+    if config["data"]["residual_normalization"] not in ("train_residual", "target_scale"):
+        raise ValueError("Unknown residual_normalization")
     if "study" not in config or "steps" in config["evaluation"] or "num_steps" in config["diffusion"]:
         raise ValueError("Use the new total-T config/step_study.yaml, not a legacy DDIM-sweep config")
     if args.smoke:
@@ -222,14 +253,14 @@ def main():
         raise ValueError("relative_loss_epsilon must be positive")
     if eval_config["near_optimal_tolerance"] < 0:
         raise ValueError("Near-optimal tolerance must be nonnegative")
-    datasets, scaler = prepare_daily(raw, weather_set, config["data"]["train_fraction"],
-                                    config["data"]["val_fraction"], smoke=args.smoke)
+    datasets, scaler = prepare_daily(raw, weather_set, config["data"]["train_years"],
+                                    config["data"]["val_years"], config["data"]["test_years"], smoke=args.smoke)
     condition_dim = scaler["condition_dim"]
     output = Path(args.output)
     if args.evaluate_only:
         manifest = json.loads((output / "manifest.json").read_text())
-        if manifest.get("experiment") != "exogenous_total_diffusion_steps_v3":
-            raise ValueError("Legacy history/DDIM checkpoints cannot be reused for condition-only daily generation")
+        if manifest.get("experiment") != "paper_daily_total_diffusion_steps_v4":
+            raise ValueError("Legacy history/ratio-split checkpoints cannot be reused for the fixed-year PV-year task")
         if manifest["config"] != config or manifest["scaler"] != scaler or manifest["variables"] != names or manifest["seeds"] != args.seeds:
             raise ValueError("Evaluation-only requires original config, data, variable order and seeds")
     else:
@@ -237,10 +268,12 @@ def main():
             raise ValueError("Refusing to overwrite a nonempty run directory")
         output.mkdir(parents=True, exist_ok=True)
         commit = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
-        dump_json(output / "manifest.json", {"experiment": "exogenous_total_diffusion_steps_v3",
+        dump_json(output / "manifest.json", {"experiment": "paper_daily_total_diffusion_steps_v4",
+                  "paper_task_source": "wenzi0731/wenzia:2-stages/dataset.py",
+                  "paper_task_reference_commit": "4dcb890a35c6597faeeecdcdfd47192c9a737e65",
                   "config": config, "scaler": scaler, "variables": names,
                   "plot_variables": plot_names, "sampler": "DDPM_full_chain",
-                  "ncrps_definition": "sum empirical CRPS(original units) / sum abs(target in original units)",
+                  "ncrps_definition": "sum empirical CRPS(original units) / (sum abs(target in original units) + 1e-8)",
                   "seeds": args.seeds, "synthetic": args.synthetic, "smoke": args.smoke,
                   "device": args.device, "torch": torch.__version__, "numpy": np.__version__,
                   "python": platform.python_version(), "base_commit": commit})
@@ -255,6 +288,13 @@ def main():
         else:
             fit(baseline, datasets, train_config, args.device, seed, seed_dir / "dlinear.pt", stage1=True)
         baseline.eval().requires_grad_(False)
+        residual_stats_path = seed_dir / "residual_scaler.json"
+        if args.evaluate_only:
+            residual_stats = json.loads(residual_stats_path.read_text())
+        else:
+            residual_stats = fit_residual_scaler(baseline, datasets["train"], scaler["scale"],
+                train_config["batch_size"], args.device, config["data"]["residual_normalization"])
+            dump_json(residual_stats_path, residual_stats)
         dump_json(seed_dir / "residual_diagnostics.json", residual_diagnostics(baseline, datasets["val"], train_config["batch_size"], args.device, names))
         for total_steps in config["study"]["diffusion_steps"]:
             step_dir = seed_dir / f"T_{total_steps}"
@@ -266,6 +306,9 @@ def main():
                 # Fresh pair at every T; matched initialization/data/noise within pair.
                 seed_everything(seed)
                 model = ExogenousCSDI(len(names), resolved, args.device, condition_dim).to(args.device)
+                if method == "residual":
+                    model.residual_center.copy_(torch.tensor(residual_stats["center_target_units"], device=args.device))
+                    model.residual_scale.copy_(torch.tensor(residual_stats["scale_target_units"], device=args.device))
                 if args.evaluate_only:
                     model.load_state_dict(torch.load(step_dir / f"{method}.pt", map_location=args.device, weights_only=True))
                     model.eval()

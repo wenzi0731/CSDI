@@ -10,17 +10,22 @@ DLinear + Residual CSDI，并执行完整 T 步 DDPM。T 不是固定模型下�
 
 ## 任务依据与实现范围
 
-已参考论文配套实现：
-- 2-stage-now/dataset.py 中的 HEEWDailyStage1Dataset；
-- 2-stage-now/configs/train_stage1.yaml、train_stage2.yaml；
-- 2-stages/README.md、dataset_stage2.py、model_stage2.py。
+任务依据为 wenzi0731/wenzia 仓库 commit
+`4dcb890a35c6597faeeecdcdfd47192c9a737e65` 的 `2-stages/`：
+
+- dataset.py 中的 HEEWDailyStage1Dataset；
+- configs/train_stage1.yaml、configs/train_stage2.yaml；
+- dataset_stage2.py、model_stage2.py、metrics_stage2.py。
+
+以当前数据加载器为准，不沿用早期 README 中的比例划分。
 
 对齐内容包括：四个目标通道及顺序、条件通道、完整 24 小时样本、
-80/10/10 按日时间划分、训练集统计量归一化、条件生成而非历史预测。
+2014–2020 年训练、2021 年验证、2022 年测试、训练集统计量归一化，
+以及条件生成而非历史预测。
 时间编码为 month/dayofyear/weekday/hour 的 sin/cos，共 8 个通道。
-默认 pv11 气象通道为：
+默认 pv10 气象通道为：
 
-Temperature, Dew Point, Humidity, Wind Speed, Wind Gust, Pressure, Precip,
+Temperature, Dew Point, Humidity, Wind Speed, Pressure, Precip,
 ALLSKY_SFC_SW_DWN, CLRSKY_SFC_SW_DWN, PV_CLEARNESS_RATIO, PV_IS_DAYLIGHT。
 
 保留本对照实验指定的 DLinear + CSDI，不把论文中的 LCGT/PCMCI 等完整
@@ -29,12 +34,18 @@ ALLSKY_SFC_SW_DWN, CLRSKY_SFC_SW_DWN, PV_CLEARNESS_RATIO, PV_IS_DAYLIGHT。
 
 ## 两组模型实际读取什么
 
-令 C 为 [24,19] 的天气和日历条件，Y 为 [24,4] 的目标能源曲线。
+令 C 为 [24,18] 的天气和日历条件，Y 为 [24,4] 的目标能源曲线，
+z=(year−2014)/6 为单独传入的 PV 年份坐标。
 
 | 模型 | 条件 | 扩散目标 | 最终样本 |
 | --- | --- | --- | --- |
-| Direct CSDI | C | Y | generated Y |
-| DLinear + Residual CSDI | C 和可选 mu(C) | R=Y-mu(C) | mu(C)+generated R |
+| Direct CSDI | C；PV 输出头另收 z | 标准化 Y | 逆标准化 generated Y |
+| DLinear + Residual CSDI | C 和可选 mu(C,z)；PV 输出头另收 z | 标准化残差 R | mu(C,z)+残差均值+残差尺度×generated R |
+
+z 不拼入共享天气/日历条件。DLinear 仅在 PV 输出应用年份 FiLM，
+CSDI 仅在 PV 噪声预测头应用年份 FiLM。2021、2022 的 z 为 7/6、8/6。
+这是“年份的显式注入仅位于 PV 头”，不保证联合采样中其他变量完全
+不受间接影响：变量注意力及含 PV 的基准曲线仍允许跨变量信息传播。
 
 DLinear 每个种子训练一次后冻结，各 T 复用。由于原版 DLinear 假定输入
 和输出是同一组时间序列，这里明确采用 **Conditional DLinear 改编**：
@@ -52,9 +63,15 @@ Direct 的第二个辅助输入为零；Residual 默认显式接收冻结的 mu(
 这样可以进一步区分“残差化”和“显式基准曲线引导”的影响。
 此设置改变了实验定义，需使用新输出目录重新训练。
 
-所有扩散目标都使用原能源的训练集尺度。**残差不再次单独标准化**，
-与论文原第二阶段的残差重标准化不同，目的是保留该对照的控制变量。
-如需比较残差重标准化，应另开消融而不能混入主实验。
+默认 data.residual_normalization=train_residual：冻结 DLinear 后，
+仅用训练日的物理量纲残差拟合每变量均值及样本标准差（加 1e-6），
+与论文第二阶段的残差归一化口径一致。验证、测试复用训练统计量。
+生成后先还原残差并加回基准曲线，最后对完整能源序列评分。
+
+设为 target_scale 可关闭残差重新标准化：残差均值固定为 0，尺度
+使用原目标训练标准差。这是建议报告的消融，区分残差化与重新缩放
+的贡献；与 condition_on_skeleton=false 组合可进一步控制显式结构条件。
+每种配置均需新输出目录、独立训练，不能混入一条曲线。
 没有额外施加非负裁剪或 PV 夜间强制归零，避免后处理改变曲线归因。
 
 ## 使用真实论文数据
@@ -66,21 +83,21 @@ python -m pip install -r requirements-step-study.txt
 python -m unittest discover -s tests -v
 
 python -m step_study.run \
-  --energy-path Data/Total_energy.csv \
-  --weather-path Data/Total_weather.csv \
+  --energy-path /path/to/wenzia/2-stages/Data/CN03_energy_cleaned.csv \
+  --weather-path /path/to/wenzia/2-stages/Data/weather_cleaned.csv \
   --diffusion-steps 10 20 50 100 200 \
   --device cuda:0 --seeds 42 43 44 \
   --output step_study_runs/paper_conditioned
 ```
 
 两个 CSV 都须包含 Year,Month,Day,Hour，并包含上述目标/条件字段。
-按时间戳连接，允许两张表行序不同；重复或不匹配时间戳直接报错，
-不会像旧配套加载器那样静默截断较长表。丢弃非完整 24 小时的日，
-在 manifest 记录丢弃数量。随后按完整日顺序做 80/10/10 划分；
+按时间戳交集连接，允许两张表行序不同；重复时间戳直接报错。
+记录两表未匹配小时数，丢弃交集中非完整 24 小时的日，
+在 manifest 记录丢弃数量。随后按配置中的自然年固定划分；
 目标和天气的均值/标准差只用训练日拟合，标准差加 1e-6。
 日历周期编码不再拟合 scaler。
 
-data.weather_feature_set 支持 pv11（默认）、pv9、base7；
+data.weather_feature_set 支持 pv10（默认）、base6；
 只有天气列改变，始终保留 8 个日历条件。默认所有四个能源目标联合生成，
 输出顺序为 Electricity,Heat,Cooling,PV，不依赖 CSV 内的列排列顺序。
 --plot-variables 可改变四个子图的显示顺序。
@@ -89,21 +106,22 @@ data.weather_feature_set 支持 pv11（默认）、pv9、base7；
 
 ```bash
 python -m step_study.run \
-  --energy-path Data/Total_energy.csv \
-  --weather-path Data/Total_weather.csv \
+  --energy-path /path/to/wenzia/2-stages/Data/CN03_energy_cleaned.csv \
+  --weather-path /path/to/wenzia/2-stages/Data/weather_cleaned.csv \
   --smoke --seeds 42 --output step_study_runs/paper_smoke
 
 python -m step_study.run --synthetic --smoke --seeds 42 \
   --output step_study_runs/condition_demo
 ```
 
-smoke 保持 24 小时日样本、19 条件、4 目标、完整日划分和训练 scaler，
+smoke 保持 24 小时日样本、18 条件及独立 PV 年份、4 目标、自然年划分和训练 scaler，
 仅缩小模型、训练一轮，并在原 split 内确定性抽取最多 16/4/4 日；
 默认 T=[10,20,40]，4 个生成样本。图片标注 DEMONSTRATION ONLY。
 这用于数据接口和流程测试，不能据其效果得出论文结论。
 
 使用相同参数加 --evaluate-only 可以重跑保存权重的评估。
-历史预测版本、旧 DDIM 版本的配置与权重不能用于当前入口。
+历史预测版本、旧 DDIM 版本以及旧比例划分版本的配置与权重不能用于
+当前 v4 入口。省略 --seeds 时默认 42；正式实验建议至少三个种子。
 初次训练不覆盖非空输出目录，数据与配置指纹用于检查评估复现。
 旧 --data/--columns/NumPy 历史预测入口已从主命令移除。
 
@@ -129,12 +147,13 @@ python -m step_study.plotting --run step_study_runs/paper_conditioned
 曲线是种子均值，阴影为总体标准差而非置信区间，低于零部分截至零。
 所有评分针对最终完整能源序列，不用残差自身的评分替代。
 
-nCRPS_i(T) = sum_j CRPS(F_ij,T,y_ij) / sum_j |y_ij|。
+nCRPS_i(T) = sum_j CRPS(F_ij,T,y_ij) / (sum_j |y_ij| + 1e-8)。
 
 j 遍历评估日和小时；分子/分母均在原能源量纲计算。该归一化与原
 CSDI 的目标绝对值口径一致，这里使用精确的经验分布 CRPS，而不是
 原实现的 19 分位点近似。nCRPS 不是 CRPS/training_std，也不乘100。
-某变量的评估目标全为零时 nCRPS 未定义，代码报错。
+分母加 1e-8 与论文指标实现一致。某变量目标全零或量级极小时，
+稳定化后的分数也可能非常大，应结合保存的分母与原尺度 CRPS 解读。
 
 r_m,i,s(T) = [M_m,i,s(T)-min_T' M_m,i,s(T')]
              / [min_T' M_m,i,s(T')+epsilon]，M=nCRPS，epsilon=1e-8。
@@ -169,6 +188,7 @@ DLinear 的额外参数/训练成本属于两阶段系统，不计为扩散骨�
 - manifest.json：任务类型、条件列、目标列、日划分、实际评估日期、
   数据指纹、scaler、配置、种子与环境。
 - seed_*/dlinear.pt：条件 DLinear 权重，每个种子一份。
+- seed_*/residual_scaler.json：训练残差均值/尺度及归一化模式。
 - seed_*/T_*/direct.pt、residual.pt：每个 T 独立的扩散模型权重。
 - seed_*/T_*/diffusion_config.json：T、日程、终端 alpha_bar。
 - *.history.json：训练及验证损失。

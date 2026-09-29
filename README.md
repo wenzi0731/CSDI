@@ -9,8 +9,11 @@ plus validation-selected shared-step diagnostics. [运行与指标说明](STEP_S
 
 The study is aligned with the paper's **condition-only daily energy scenario**
 task: target-day weather + cyclical calendar -> 24-hour Electricity/Heat/Cooling/PV.
-It does not use historical energy. Use `--energy-path Data/Total_energy.csv`
-and `--weather-path Data/Total_weather.csv`. The first stage is a documented
+It does not use historical energy. It uses 10 weather + 8 calendar channels,
+fixed 2014–2020 / 2021 / 2022 splits, and a separate PV-only year coordinate.
+Use `--energy-path /path/to/2-stages/Data/CN03_energy_cleaned.csv`
+and `--weather-path /path/to/2-stages/Data/weather_cleaned.csv`. Residual scaling
+is fitted on training days only and inverted before scoring. The first stage is a documented
 exogenous-input adaptation of DLinear, not the paper's full LCGT architecture.
 
 This is the github repository for the NeurIPS 2021 paper "[CSDI: Conditional Score-based Diffusion Models for Probabilistic Time Series Imputation](https://arxiv.org/abs/2107.03502)".

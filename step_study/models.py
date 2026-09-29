@@ -153,13 +153,25 @@ class ConditionalDLinear(nn.Module):
     This is an adapted baseline, not the paper's LCGT/PCMCI first-stage model.
     """
 
-    def __init__(self, seq_len, condition_dim, target_dim=4, kernel=5, individual=True):
+    def __init__(self, seq_len, condition_dim, target_dim=4, kernel=5, individual=True,
+                 pv_year_film_scale=.20):
         super().__init__()
+        if target_dim != 4:
+            raise ValueError("Paper target order must be Electricity, Heat, Cooling, PV")
         self.temporal = DLinear(seq_len, seq_len, condition_dim, kernel, individual)
         self.output_projection = nn.Linear(condition_dim, target_dim)
+        self.pv_year_film = nn.Linear(1, 2)
+        self.pv_year_film_scale = pv_year_film_scale
+        nn.init.zeros_(self.pv_year_film.weight)
+        nn.init.zeros_(self.pv_year_film.bias)
 
-    def forward(self, conditions):
-        return self.output_projection(self.temporal(conditions))
+    def forward(self, conditions, pv_year):
+        if pv_year.shape != (*conditions.shape[:2], 1):
+            raise ValueError("pv_year must be a separate [batch,24,1] coordinate")
+        result = self.output_projection(self.temporal(conditions))
+        gamma, shift = self.pv_year_film(pv_year).chunk(2, dim=-1)
+        pv = result[..., 3:4] * (1 + self.pv_year_film_scale * gamma.tanh()) + shift
+        return torch.cat([result[..., :3], pv], dim=-1)
 
 
 class ExogenousCSDI(ForecastCSDI):
@@ -172,27 +184,39 @@ class ExogenousCSDI(ForecastCSDI):
 
     def __init__(self, variables, config, device, condition_dim):
         super().__init__(variables, config, device)
+        if variables != 4:
+            raise ValueError("Paper target order must be Electricity, Heat, Cooling, PV")
         self.condition_dim = condition_dim
         self.condition_on_skeleton = config["model"].get("condition_on_skeleton", True)
         for block in self.diffmodel.residual_layers:
             block.cond_projection = Conv1d_with_init(self.emb_total_dim + condition_dim,
                                                     2 * config["diffusion"]["channels"], 1)
+        self.pv_year_film = nn.Linear(1, 2 * config["diffusion"]["channels"])
+        self.pv_year_film_scale = config["model"].get("pv_year_film_scale", .20)
+        nn.init.zeros_(self.pv_year_film.weight)
+        nn.init.zeros_(self.pv_year_film.bias)
+        self.register_buffer("residual_center", torch.zeros(variables))
+        self.register_buffer("residual_scale", torch.ones(variables))
 
-    def pack_conditions(self, conditions, skeleton=None):
+    def pack_conditions(self, conditions, skeleton=None, pv_year=None):
         if conditions.shape[-1] != self.condition_dim:
             raise ValueError("Expected weather/calendar features, not target/history values")
+        if pv_year is None or pv_year.shape != (*conditions.shape[:2], 1):
+            raise ValueError("A separate PV-only year coordinate [batch,24,1] is required")
         if skeleton is None or not self.condition_on_skeleton:
             skeleton = conditions.new_zeros(*conditions.shape[:2], self.target_dim)
         if skeleton.shape != (*conditions.shape[:2], self.target_dim):
             raise ValueError("Skeleton shape must be [batch, day length, target variables]")
-        return torch.cat([conditions, skeleton], dim=-1)
+        # Packed solely for repeat_interleave during sampling. Year is never
+        # concatenated to weather/calendar side_info or the shared noisy input.
+        return torch.cat([conditions, skeleton, pv_year], dim=-1)
 
     def context(self, packed_conditions, horizon):
         b, length, width = packed_conditions.shape
-        if length != horizon or width != self.condition_dim + self.target_dim:
+        if length != horizon or width != self.condition_dim + self.target_dim + 1:
             raise ValueError("Use target-day conditions (same length as generated day)")
         conditions = packed_conditions[..., :self.condition_dim]
-        skeleton = packed_conditions[..., self.condition_dim:]
+        skeleton = packed_conditions[..., self.condition_dim:self.condition_dim+self.target_dim]
         mask = packed_conditions.new_zeros(b, self.target_dim, length)
         positions = torch.arange(length, device=packed_conditions.device).expand(b, -1)
         side = self.get_side_info(positions, mask)
@@ -202,4 +226,15 @@ class ExogenousCSDI(ForecastCSDI):
     def predict_noise(self, noisy_future, packed_conditions, context, t):
         skeleton, _, side = context
         inputs = torch.stack([skeleton, noisy_future.transpose(1, 2)], dim=1)
-        return self.diffmodel(inputs, side, t).transpose(1, 2)
+        predicted, hidden = self.diffmodel(inputs, side, t, return_hidden=True)
+        year = packed_conditions[..., -1:]
+        gamma, shift = self.pv_year_film(year).transpose(1, 2).chunk(2, dim=1)
+        pv_hidden = hidden[:, :, 3, :] * (1 + self.pv_year_film_scale * gamma.tanh()) + shift
+        pv_noise = self.diffmodel.output_projection2(pv_hidden)
+        return torch.cat([predicted[:, :3], pv_noise], dim=1).transpose(1, 2)
+
+    def normalize_residual(self, truth, skeleton):
+        return (truth - skeleton - self.residual_center) / self.residual_scale
+
+    def reconstruct(self, samples, skeleton):
+        return skeleton[:, None] + samples * self.residual_scale + self.residual_center

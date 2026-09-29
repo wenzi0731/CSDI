@@ -12,6 +12,7 @@ import yaml
 from step_study.condition_data import (TARGETS, WEATHER_SETS, calendar_features,
     load_daily_csv, prepare_daily, synthetic_daily)
 from step_study.models import ConditionalDLinear, ExogenousCSDI
+from step_study.run import fit_residual_scaler
 
 
 class ConditionTaskTests(unittest.TestCase):
@@ -26,9 +27,9 @@ class ConditionTaskTests(unittest.TestCase):
         raw = synthetic_daily(days=20)
         splits, info = prepare_daily(raw)
         self.assertEqual(info["split_day_counts"], {"train": 16, "val": 2, "test": 2})
-        self.assertEqual(info["condition_dim"], 19)
-        conditions, targets = splits["val"][0]
-        self.assertEqual(conditions.shape, (24, 19))
+        self.assertEqual(info["condition_dim"], 18)
+        conditions, targets, year = splits["val"][0]
+        self.assertEqual(conditions.shape, (24, 18))
         self.assertEqual(targets.shape, (24, 4))
         changed_targets = raw[0].copy()
         changed_targets[16:] += 10000
@@ -60,48 +61,48 @@ class ConditionTaskTests(unittest.TestCase):
                     writer.writerow(prefix + columns)
                     writer.writerows(rows)
             energy_rows = [[2020, 1, 1, hour]+[float(hour)]*4 for hour in range(24)]
-            weather_rows = [[2020, 1, 1, hour]+[float(hour)]*11 for hour in reversed(range(24))]
+            weather_rows = [[2020, 1, 1, hour]+[float(hour)]*10 for hour in reversed(range(24))]
             energy_rows.append([2020, 1, 2, 0]+[0.]*4)
-            weather_rows.append([2020, 1, 2, 0]+[0.]*11)
+            weather_rows.append([2020, 1, 2, 0]+[0.]*10)
             write(energy_path, TARGETS, energy_rows)
-            write(weather_path, WEATHER_SETS["pv11"], weather_rows)
+            write(weather_path, WEATHER_SETS["pv10"], weather_rows)
             energy, meteo, _, dates, dropped = load_daily_csv(energy_path, weather_path)
             self.assertEqual(dates, ["2020-01-01"])
-            self.assertEqual(dropped, 1)
+            self.assertEqual(dropped["dropped_incomplete_days"], 1)
             np.testing.assert_array_equal(energy[0, :, 0], meteo[0, :, 0])
-            write(weather_path, WEATHER_SETS["pv11"], weather_rows[:-1])
-            with self.assertRaisesRegex(ValueError, "timestamps differ"):
-                load_daily_csv(energy_path, weather_path)
-            write(weather_path, WEATHER_SETS["pv11"], weather_rows + weather_rows[:1])
+            write(weather_path, WEATHER_SETS["pv10"], weather_rows[:-1])
+            aligned = load_daily_csv(energy_path, weather_path)
+            self.assertEqual(aligned[4]["energy_hours_without_weather"], 1)
+            write(weather_path, WEATHER_SETS["pv10"], weather_rows + weather_rows[:1])
             with self.assertRaisesRegex(ValueError, "duplicate timestamp"):
                 load_daily_csv(energy_path, weather_path)
 
-    def test_conditional_dlinear_maps_19_conditions_to_four_targets(self):
-        model = ConditionalDLinear(24, 19, 4)
-        conditions = torch.randn(2, 24, 19)
-        result = model(conditions)
+    def test_conditional_dlinear_maps_18_conditions_to_four_targets(self):
+        model = ConditionalDLinear(24, 18, 4)
+        conditions = torch.randn(2, 24, 18)
+        result = model(conditions, torch.zeros(2, 24, 1))
         self.assertEqual(result.shape, (2, 24, 4))
         result.square().mean().backward()
         self.assertTrue(all(p.grad is not None for p in model.parameters()))
 
     def test_external_conditions_and_skeleton_reach_denoiser(self):
-        model = ExogenousCSDI(4, self.config, "cpu", 19).eval()
-        conditions = torch.randn(2, 24, 19)
+        model = ExogenousCSDI(4, self.config, "cpu", 18).eval()
+        conditions = torch.randn(2, 24, 18)
         skeleton = torch.randn(2, 24, 4)
-        direct = model.pack_conditions(conditions)
-        residual = model.pack_conditions(conditions, skeleton)
-        torch.testing.assert_close(direct[..., :19], residual[..., :19])
-        self.assertEqual(direct[..., 19:].count_nonzero(), 0)
+        direct = model.pack_conditions(conditions, pv_year=torch.zeros(2, 24, 1))
+        residual = model.pack_conditions(conditions, skeleton, torch.zeros(2, 24, 1))
+        torch.testing.assert_close(direct[..., :18], residual[..., :18])
+        self.assertEqual(direct[..., 18:].count_nonzero(), 0)
         observed, mask, side = model.context(residual, 24)
         torch.testing.assert_close(observed, skeleton.transpose(1, 2))
         self.assertEqual(mask.count_nonzero(), 0)  # no observed energy anywhere
-        torch.testing.assert_close(side[:, -19:, 0], conditions.transpose(1, 2))
+        torch.testing.assert_close(side[:, -18:, 0], conditions.transpose(1, 2))
         noisy = torch.randn(2, 24, 4)
         t = torch.tensor([3, 4])
         # Upstream output weights initialize to zero; activate them to test dependence.
         torch.nn.init.normal_(model.diffmodel.output_projection2.weight, std=.1)
         a = model.predict_noise(noisy, direct, model.context(direct, 24), t)
-        changed = model.pack_conditions(conditions + 1)
+        changed = model.pack_conditions(conditions + 1, pv_year=torch.zeros(2, 24, 1))
         b = model.predict_noise(noisy, changed, model.context(changed, 24), t)
         c = model.predict_noise(noisy, residual, model.context(residual, 24), t)
         self.assertGreater((a-b).abs().max().item(), 1e-6)
@@ -110,17 +111,66 @@ class ConditionTaskTests(unittest.TestCase):
     def test_joint_sampling_and_skeleton_ablation(self):
         config = copy.deepcopy(self.config)
         config["model"]["condition_on_skeleton"] = False
-        model = ExogenousCSDI(4, config, "cpu", 19).eval()
-        conditions = torch.randn(2, 24, 19)
-        torch.testing.assert_close(model.pack_conditions(conditions),
-                                   model.pack_conditions(conditions, torch.randn(2, 24, 4)))
-        packed = model.pack_conditions(conditions)
+        model = ExogenousCSDI(4, config, "cpu", 18).eval()
+        conditions = torch.randn(2, 24, 18)
+        torch.testing.assert_close(model.pack_conditions(conditions, pv_year=torch.zeros(2, 24, 1)),
+                                   model.pack_conditions(conditions, torch.randn(2, 24, 4), torch.zeros(2, 24, 1)))
+        packed = model.pack_conditions(conditions, pv_year=torch.zeros(2, 24, 1))
         samples = model.sample_ddpm(packed, torch.randn(2, 3, 24, 4), torch.Generator().manual_seed(1))
         self.assertEqual(samples.shape, (2, 3, 24, 4))
         self.assertTrue(torch.isfinite(samples).all())
         model.train()
         model.loss(packed, torch.randn(2, 24, 4)).backward()
         self.assertTrue(all(p.grad is not None for p in model.parameters()))
+
+    def test_fixed_year_splits_and_separate_year_coordinate(self):
+        splits, info = prepare_daily(synthetic_daily(days=63))
+        self.assertEqual(info["year_splits"], {"train": list(range(2014, 2021)), "val": [2021], "test": [2022]})
+        self.assertEqual(splits["train"].dates[0], "2014-01-01")
+        self.assertTrue(splits["train"].dates[-1].startswith("2020-"))
+        for split, index, expected in [("train", 0, 0.), ("train", -1, 1.),
+                                        ("val", 0, 7/6), ("test", 0, 8/6)]:
+            torch.testing.assert_close(splits[split][index][2], torch.full((24, 1), expected))
+        self.assertFalse(info["pv_year_shared_condition"])
+        with self.assertRaisesRegex(ValueError, "disjoint"):
+            prepare_daily(synthetic_daily(), val_years=(2020,))
+
+    def test_year_injection_changes_only_pv_head_at_fixed_state(self):
+        conditions, year = torch.randn(2, 24, 18), torch.zeros(2, 24, 1)
+        baseline = ConditionalDLinear(24, 18).eval()
+        torch.nn.init.constant_(baseline.pv_year_film.weight, .3)
+        a, b = baseline(conditions, year), baseline(conditions, year+1)
+        torch.testing.assert_close(a[..., :3], b[..., :3], rtol=0, atol=0)
+        self.assertGreater((a[..., 3]-b[..., 3]).abs().max().item(), 1e-6)
+        model = ExogenousCSDI(4, self.config, "cpu", 18).eval()
+        torch.nn.init.constant_(model.pv_year_film.weight, .3)
+        torch.nn.init.constant_(model.diffmodel.output_projection2.weight, .1)
+        noisy, t = torch.randn(2, 24, 4), torch.tensor([3, 4])
+        p0 = model.pack_conditions(conditions, pv_year=year)
+        p1 = model.pack_conditions(conditions, pv_year=year+1)
+        a = model.predict_noise(noisy, p0, model.context(p0, 24), t)
+        b = model.predict_noise(noisy, p1, model.context(p1, 24), t)
+        torch.testing.assert_close(a[..., :3], b[..., :3], rtol=0, atol=0)
+        self.assertGreater((a[..., 3]-b[..., 3]).abs().max().item(), 1e-6)
+
+    def test_training_residual_scaler_and_reconstruction(self):
+        splits, info = prepare_daily(synthetic_daily())
+        baseline = ConditionalDLinear(24, 18).eval()
+        stats = fit_residual_scaler(baseline, splits["train"], info["scale"], 8, "cpu")
+        dataset = splits["train"]
+        with torch.no_grad():
+            skeleton = baseline(dataset.conditions, dataset.pv_year)
+        physical = ((dataset.targets-skeleton)*torch.tensor(info["scale"])).flatten(0, 1)
+        torch.testing.assert_close(torch.tensor(stats["center_physical"]), physical.mean(0))
+        torch.testing.assert_close(torch.tensor(stats["scale_physical"]), physical.std(0)+1e-6)
+        model = ExogenousCSDI(4, self.config, "cpu", 18)
+        model.residual_center.copy_(torch.tensor(stats["center_target_units"]))
+        model.residual_scale.copy_(torch.tensor(stats["scale_target_units"]))
+        residual = model.normalize_residual(dataset.targets, skeleton)
+        torch.testing.assert_close(model.reconstruct(residual[:, None], skeleton)[:, 0], dataset.targets)
+        identity = fit_residual_scaler(baseline, dataset, info["scale"], 8, "cpu", "target_scale")
+        self.assertEqual(identity["center_target_units"], [0.]*4)
+        self.assertEqual(identity["scale_target_units"], [1.]*4)
 
 
 if __name__ == "__main__":

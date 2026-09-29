@@ -19,12 +19,17 @@ def energy_score(samples, truth):
             - .5 * torch.cdist(flattened, flattened).mean((1, 2)))
 
 
-def ncrps_from_sums(crps_sum_original, abs_target_sum_original):
+def ncrps_from_sums(crps_sum_original, abs_target_sum_original, epsilon=None):
     """CSDI-style magnitude normalization, using exact empirical ensemble CRPS.
 
-    Inputs are per-variable sums over all evaluation windows/horizons. Reject an
-    all-zero target variable: its normalized score is undefined, not zero.
+    Inputs are per-variable sums over all evaluation windows/horizons. Without
+    epsilon, reject all-zero target variables. The paper task passes epsilon=1e-8
+    to match its stabilized denominator; such scores need magnitude context.
     """
+    if epsilon is not None:
+        if epsilon <= 0 or not torch.isfinite(abs_target_sum_original).all() or (abs_target_sum_original < 0).any():
+            raise ValueError("Require positive epsilon and finite nonnegative magnitude sums")
+        return crps_sum_original / (abs_target_sum_original + epsilon)
     if not torch.isfinite(abs_target_sum_original).all() or (abs_target_sum_original <= 0).any():
         raise ValueError("nCRPS undefined for nonfinite or all-zero original-scale targets")
     return crps_sum_original / abs_target_sum_original
