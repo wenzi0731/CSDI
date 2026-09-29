@@ -14,9 +14,9 @@ import torch
 import yaml
 from torch.utils.data import DataLoader
 
-from .data import load_series, prepare, synthetic_series
+from .condition_data import TARGETS, load_daily_csv, prepare_daily, synthetic_daily
 from .metrics import crps, energy_score, ncrps_from_sums, relative_loss_rows, step_summary
-from .models import DLinear, ForecastCSDI
+from .models import ConditionalDLinear, ExogenousCSDI
 from .plotting import plot_curves, select_plot_variables
 
 
@@ -50,34 +50,35 @@ def fit(model, datasets, config, device, seed, path, baseline=None, stage1=False
     optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"])
     epochs = config["dlinear_epochs" if stage1 else "diffusion_epochs"]
     best, log = float("inf"), []
-    def objective(history, truth):
+    def objective(conditions, truth):
         if stage1:
-            return torch.nn.functional.mse_loss(model(history), truth)
+            return torch.nn.functional.mse_loss(model(conditions), truth)
         with torch.no_grad():
-            target = truth if baseline is None else truth - baseline(history)
-        return model.loss(history, target)
+            skeleton = None if baseline is None else baseline(conditions)
+            target = truth if skeleton is None else truth - skeleton
+        return model.loss(model.pack_conditions(conditions, skeleton), target)
     for epoch in range(epochs):
         model.train()
         train_sum, seen = 0., 0
-        for history, truth in train:
-            history, truth = history.to(device), truth.to(device)
+        for conditions, truth in train:
+            conditions, truth = conditions.to(device), truth.to(device)
             optimizer.zero_grad(set_to_none=True)
-            loss = objective(history, truth)
+            loss = objective(conditions, truth)
             if not torch.isfinite(loss):
                 raise RuntimeError("Nonfinite training loss")
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), config["grad_clip"])
             optimizer.step()
-            train_sum += loss.item() * len(history)
-            seen += len(history)
+            train_sum += loss.item() * len(conditions)
+            seen += len(conditions)
         model.eval()
         val_sum = 0.
         # Fixed validation timesteps/noise, isolated from training's RNG stream.
         devices = [torch.device(device).index or 0] if str(device).startswith("cuda") else []
         with torch.random.fork_rng(devices=devices), torch.no_grad():
             torch.manual_seed(seed + 10000)
-            for history, truth in valid:
-                val_sum += objective(history.to(device), truth.to(device)).item() * len(history)
+            for conditions, truth in valid:
+                val_sum += objective(conditions.to(device), truth.to(device)).item() * len(conditions)
         val_loss = val_sum / len(datasets["val"])
         if not np.isfinite(val_loss):
             raise RuntimeError("Nonfinite validation loss")
@@ -108,16 +109,18 @@ def evaluate(models, baseline, datasets, config, scaler, names, device, seed):
             sums = torch.zeros(len(names), device=device, dtype=torch.float64)
             squares, denominator = torch.zeros_like(sums), torch.zeros_like(sums)
             es_sum, count, windows, elapsed = 0., 0, 0, 0.
-            for history, truth in loader:
-                history, truth = history.to(device), truth.to(device)
-                noise = torch.randn((len(history), config["samples"], *truth.shape[1:]),
+            for conditions, truth in loader:
+                conditions, truth = conditions.to(device), truth.to(device)
+                noise = torch.randn((len(conditions), config["samples"], *truth.shape[1:]),
                                     generator=generator).to(device)
                 if str(device).startswith("cuda"):
                     torch.cuda.synchronize()
                 start = time.perf_counter()
-                samples = model.sample_ddpm(history, noise, reverse_generator)
-                if method == "residual":
-                    samples = samples + baseline(history)[:, None]
+                skeleton = baseline(conditions) if method == "residual" else None
+                packed = model.pack_conditions(conditions, skeleton)
+                samples = model.sample_ddpm(packed, noise, reverse_generator)
+                if skeleton is not None:
+                    samples = samples + skeleton[:, None]
                 if str(device).startswith("cuda"):
                     torch.cuda.synchronize()
                 elapsed += time.perf_counter() - start
@@ -127,8 +130,8 @@ def evaluate(models, baseline, datasets, config, scaler, names, device, seed):
                 denominator += (truth.double() * scale + mean).abs().sum((0, 1))
                 squares += (samples.mean(1) - truth).double().square().sum((0, 1))
                 es_sum += energy_score(samples, truth).sum().item()
-                windows += len(history)
-                count += len(history) * truth.shape[1]
+                windows += len(conditions)
+                count += len(conditions) * truth.shape[1]
             normalized = ncrps_from_sums(sums * scale, denominator)
             for i, name in enumerate(names):
                 rows.append({"seed": seed, "split": split, "method": method,
@@ -149,8 +152,8 @@ def evaluate(models, baseline, datasets, config, scaler, names, device, seed):
 @torch.no_grad()
 def residual_diagnostics(baseline, dataset, batch_size, device, names):
     targets, residuals = [], []
-    for history, truth in DataLoader(dataset, batch_size=batch_size):
-        mu = baseline(history.to(device)).cpu()
+    for conditions, truth in DataLoader(dataset, batch_size=batch_size):
+        mu = baseline(conditions.to(device)).cpu()
         targets.append(truth)
         residuals.append(truth - mu)
     target, residual = torch.cat(targets).flatten(0, 1), torch.cat(residuals).flatten(0, 1)
@@ -164,10 +167,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="config/step_study.yaml")
     source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--data", help="Chronologically sorted CSV or .npy [time, variables]")
+    source.add_argument("--energy-path", help="Total_energy.csv with Year/Month/Day/Hour and Electricity/Heat/Cooling/PV")
     source.add_argument("--synthetic", action="store_true", help="Pipeline demonstration only")
-    parser.add_argument("--columns", help="Comma-separated numeric CSV fields")
-    parser.add_argument("--plot-variables", help="Exactly four comma-separated variable names to plot (defaults to all if input has four)")
+    parser.add_argument("--weather-path", help="Total_weather.csv aligned by Year/Month/Day/Hour (required with --energy-path)")
+    parser.add_argument("--plot-variables", help="Optional display order for Electricity,Heat,Cooling,PV")
     parser.add_argument("--diffusion-steps", nargs="+", type=int, help="Total training/ancestral DDPM steps; train a fresh pair for each T")
     parser.add_argument("--output", required=True, help="New, empty run directory")
     parser.add_argument("--device", default="cpu", help="cpu or cuda:N")
@@ -176,6 +179,8 @@ def main():
     parser.add_argument("--evaluate-only", action="store_true", help="Reuse checkpoints in --output, no retraining")
     parser.add_argument("--threads", type=int, default=1)
     args = parser.parse_args()
+    if bool(args.energy_path) != bool(args.weather_path):
+        parser.error("Provide both --energy-path and --weather-path, or use --synthetic")
     if not (args.device == "cpu" or args.device.startswith("cuda")):
         parser.error("Use cpu or cuda:N for reproducible validation RNG isolation")
     if len(set(args.seeds)) != len(args.seeds) or any(s < 0 or s >= 2**32 - 30000 for s in args.seeds):
@@ -184,11 +189,12 @@ def main():
         parser.error("--threads must be positive")
     torch.set_num_threads(args.threads)
     config = yaml.safe_load(Path(args.config).read_text())
+    if config["data"].get("task") != "daily_exogenous" or config["data"].get("seq_len") != 24:
+        raise ValueError("Use the paper's daily_exogenous configuration with seq_len=24; history forecasts are not this task")
     if "study" not in config or "steps" in config["evaluation"] or "num_steps" in config["diffusion"]:
         raise ValueError("Use the new total-T config/step_study.yaml, not a legacy DDIM-sweep config")
     if args.smoke:
         config = copy.deepcopy(config)
-        config["data"].update(history=12, horizon=4, stride=16)
         config["dlinear"]["kernel"] = 3
         config["train"].update(dlinear_epochs=1, diffusion_epochs=1, batch_size=8)
         config["diffusion"].update(layers=1, channels=8, nheads=2, diffusion_embedding_dim=16)
@@ -197,11 +203,10 @@ def main():
         config["study"]["diffusion_steps"] = [10, 20, 40]
     if args.diffusion_steps is not None:
         config["study"]["diffusion_steps"] = args.diffusion_steps
-    if args.synthetic:
-        values = synthetic_series()
-        names = [f"variable_{i}" for i in range(values.shape[1])]
-    else:
-        values, names = load_series(args.data, args.columns)
+    weather_set = config["data"]["weather_feature_set"]
+    raw = synthetic_daily(weather_feature_set=weather_set) if args.synthetic else load_daily_csv(
+        args.energy_path, args.weather_path, weather_set)
+    names = list(TARGETS)
     plot_names = select_plot_variables(names, args.plot_variables)
     train_config, eval_config = config["train"], config["evaluation"]
     if min(train_config["dlinear_epochs"], train_config["diffusion_epochs"], train_config["batch_size"],
@@ -217,12 +222,14 @@ def main():
         raise ValueError("relative_loss_epsilon must be positive")
     if eval_config["near_optimal_tolerance"] < 0:
         raise ValueError("Near-optimal tolerance must be nonnegative")
-    datasets, scaler = prepare(values, **config["data"])
+    datasets, scaler = prepare_daily(raw, weather_set, config["data"]["train_fraction"],
+                                    config["data"]["val_fraction"], smoke=args.smoke)
+    condition_dim = scaler["condition_dim"]
     output = Path(args.output)
     if args.evaluate_only:
         manifest = json.loads((output / "manifest.json").read_text())
-        if manifest.get("experiment") != "total_diffusion_steps_v2":
-            raise ValueError("Legacy DDIM checkpoints cannot be reused for the total-T study")
+        if manifest.get("experiment") != "exogenous_total_diffusion_steps_v3":
+            raise ValueError("Legacy history/DDIM checkpoints cannot be reused for condition-only daily generation")
         if manifest["config"] != config or manifest["scaler"] != scaler or manifest["variables"] != names or manifest["seeds"] != args.seeds:
             raise ValueError("Evaluation-only requires original config, data, variable order and seeds")
     else:
@@ -230,7 +237,7 @@ def main():
             raise ValueError("Refusing to overwrite a nonempty run directory")
         output.mkdir(parents=True, exist_ok=True)
         commit = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
-        dump_json(output / "manifest.json", {"experiment": "total_diffusion_steps_v2",
+        dump_json(output / "manifest.json", {"experiment": "exogenous_total_diffusion_steps_v3",
                   "config": config, "scaler": scaler, "variables": names,
                   "plot_variables": plot_names, "sampler": "DDPM_full_chain",
                   "ncrps_definition": "sum empirical CRPS(original units) / sum abs(target in original units)",
@@ -242,7 +249,7 @@ def main():
         seed_dir = output / f"seed_{seed}"
         seed_dir.mkdir(exist_ok=True)
         seed_everything(seed)
-        baseline = DLinear(config["data"]["history"], config["data"]["horizon"], len(names), **config["dlinear"]).to(args.device)
+        baseline = ConditionalDLinear(config["data"]["seq_len"], condition_dim, len(names), **config["dlinear"]).to(args.device)
         if args.evaluate_only:
             baseline.load_state_dict(torch.load(seed_dir / "dlinear.pt", map_location=args.device, weights_only=True))
         else:
@@ -258,7 +265,7 @@ def main():
             for method in ("direct", "residual"):
                 # Fresh pair at every T; matched initialization/data/noise within pair.
                 seed_everything(seed)
-                model = ForecastCSDI(len(names), resolved, args.device).to(args.device)
+                model = ExogenousCSDI(len(names), resolved, args.device, condition_dim).to(args.device)
                 if args.evaluate_only:
                     model.load_state_dict(torch.load(step_dir / f"{method}.pt", map_location=args.device, weights_only=True))
                     model.eval()

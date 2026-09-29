@@ -137,6 +137,9 @@ class StepStudyTests(unittest.TestCase):
         class ZeroForecast:
             num_steps = 2
 
+            def pack_conditions(self, conditions, skeleton=None):
+                return conditions
+
             def sample_ddpm(self, history, initial_noise, generator):
                 return torch.zeros_like(initial_noise)
 

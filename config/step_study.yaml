@@ -1,11 +1,11 @@
 data:
-  history: 96
-  horizon: 24
-  stride: 24
-  train_fraction: 0.6
-  val_fraction: 0.2
+  task: daily_exogenous
+  seq_len: 24
+  weather_feature_set: pv11
+  train_fraction: 0.8
+  val_fraction: 0.1
 dlinear:
-  kernel: 25
+  kernel: 5
   individual: true
 train:
   batch_size: 16
@@ -23,6 +23,7 @@ diffusion:
   schedule: vp_continuous
   is_linear: false
 model:
+  condition_on_skeleton: true
   is_unconditional: false
   timeemb: 128
   featureemb: 16

@@ -6,6 +6,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from main_model import CSDI_base
+from diff_models import Conv1d_with_init
 
 
 class DLinear(nn.Module):
@@ -41,16 +42,17 @@ class DLinear(nn.Module):
 
 
 class ForecastCSDI(CSDI_base):
-    """Matched denoiser for Y or Y-mu; both condition on the same raw history.
+    """Legacy history-conditioned wrapper and common diffusion mechanics.
 
-    The frozen baseline is applied outside this class. There is no additional
-    baseline conditioning channel, no feature subsampling, and no residual scaler.
+    The paper entry point uses ExogenousCSDI below, which overrides context and
+    noise-prediction inputs. This history context is retained only for regression
+    tests; it is never used by the condition-only daily study.
     """
 
     def __init__(self, variables, config, device):
         diff = config["diffusion"]
         if config["model"]["is_unconditional"]:
-            raise ValueError("The step study requires history-conditioned diffusion")
+            raise ValueError("The step study requires conditional diffusion")
         if diff["schedule"] != "vp_continuous" and (diff["schedule"] not in ("linear", "quad") or not 0 < diff["beta_start"] <= diff["beta_end"] < 1):
             raise ValueError("Use a linear/quad schedule with 0 < beta_start <= beta_end < 1")
         if diff["num_steps"] < 2:
@@ -116,6 +118,7 @@ class ForecastCSDI(CSDI_base):
             current = next_alpha.sqrt() * clean + (1 - next_alpha).sqrt() * noise
         return current.reshape(b, samples, horizon, variables)
 
+
     @torch.no_grad()
     def sample_ddpm(self, history, initial_noise, generator):
         """Full ancestral DDPM chain: exactly T evaluations, posterior variance.
@@ -140,3 +143,63 @@ class ForecastCSDI(CSDI_base):
                 noise = torch.randn(current.shape, generator=generator, dtype=current.dtype).to(current.device)
                 current = current + variance.sqrt() * noise
         return current.reshape(b, samples, horizon, variables)
+
+
+class ConditionalDLinear(nn.Module):
+    """DLinear-style baseline adapted to exogenous daily profile generation.
+
+    Decompose each WEATHER/CALENDAR channel, linearly map time, then project
+    condition channels to four energy channels. Never reads energy history.
+    This is an adapted baseline, not the paper's LCGT/PCMCI first-stage model.
+    """
+
+    def __init__(self, seq_len, condition_dim, target_dim=4, kernel=5, individual=True):
+        super().__init__()
+        self.temporal = DLinear(seq_len, seq_len, condition_dim, kernel, individual)
+        self.output_projection = nn.Linear(condition_dim, target_dim)
+
+    def forward(self, conditions):
+        return self.output_projection(self.temporal(conditions))
+
+
+class ExogenousCSDI(ForecastCSDI):
+    """Joint condition-only CSDI, with optional frozen skeleton in input channel 0.
+
+    Both arms see identical weather/calendar side information. Direct receives a
+    zero skeleton; residual may receive the deterministic baseline. Set
+    model.condition_on_skeleton=false to isolate residualization without this cue.
+    """
+
+    def __init__(self, variables, config, device, condition_dim):
+        super().__init__(variables, config, device)
+        self.condition_dim = condition_dim
+        self.condition_on_skeleton = config["model"].get("condition_on_skeleton", True)
+        for block in self.diffmodel.residual_layers:
+            block.cond_projection = Conv1d_with_init(self.emb_total_dim + condition_dim,
+                                                    2 * config["diffusion"]["channels"], 1)
+
+    def pack_conditions(self, conditions, skeleton=None):
+        if conditions.shape[-1] != self.condition_dim:
+            raise ValueError("Expected weather/calendar features, not target/history values")
+        if skeleton is None or not self.condition_on_skeleton:
+            skeleton = conditions.new_zeros(*conditions.shape[:2], self.target_dim)
+        if skeleton.shape != (*conditions.shape[:2], self.target_dim):
+            raise ValueError("Skeleton shape must be [batch, day length, target variables]")
+        return torch.cat([conditions, skeleton], dim=-1)
+
+    def context(self, packed_conditions, horizon):
+        b, length, width = packed_conditions.shape
+        if length != horizon or width != self.condition_dim + self.target_dim:
+            raise ValueError("Use target-day conditions (same length as generated day)")
+        conditions = packed_conditions[..., :self.condition_dim]
+        skeleton = packed_conditions[..., self.condition_dim:]
+        mask = packed_conditions.new_zeros(b, self.target_dim, length)
+        positions = torch.arange(length, device=packed_conditions.device).expand(b, -1)
+        side = self.get_side_info(positions, mask)
+        external = conditions.transpose(1, 2).unsqueeze(2).expand(-1, -1, self.target_dim, -1)
+        return skeleton.transpose(1, 2), mask, torch.cat([side, external], dim=1)
+
+    def predict_noise(self, noisy_future, packed_conditions, context, t):
+        skeleton, _, side = context
+        inputs = torch.stack([skeleton, noisy_future.transpose(1, 2)], dim=1)
+        return self.diffmodel(inputs, side, t).transpose(1, 2)

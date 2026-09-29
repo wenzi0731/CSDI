@@ -97,7 +97,7 @@ def main():
     args = parser.parse_args()
     output = Path(args.run)
     manifest = json.loads((output / "manifest.json").read_text())
-    if manifest.get("experiment") != "total_diffusion_steps_v2":
+    if manifest.get("experiment") not in ("total_diffusion_steps_v2", "exogenous_total_diffusion_steps_v3"):
         raise ValueError("Expected a completed total-T study, not a legacy DDIM run")
     names = select_plot_variables(manifest["variables"], args.plot_variables or ",".join(manifest["plot_variables"]))
     def read_rows(path):

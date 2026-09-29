@@ -1,153 +1,182 @@
-# 总扩散步数实验：Direct CSDI vs DLinear + Residual CSDI
+# 论文任务适配：条件多能源场景生成的扩散步数实验
 
-本实验比较总扩散步数 **T**，不是固定模型下的 DDIM 采样预算 K。
-每个 T 重新训练一对联合模型，并执行完整的 T 步 DDPM 反向采样。
-任务仍为“历史窗口 → 多变量未来序列”的条件生成。
+当前入口针对论文配套代码 HEEWDailyStage1Dataset 的任务：
+给定**目标日天气与日历条件**，联合生成当天 24 小时的
+**Electricity、Heat、Cooling、PV**。模型不读取历史能源序列，
+也不读取目标日的真实能源值作为条件。
 
-## 运行
+默认 T=[10,20,50,100,200]。每个 T 独立训练 Direct CSDI 与
+DLinear + Residual CSDI，并执行完整 T 步 DDPM。T 不是固定模型下的 DDIM K。
+
+## 任务依据与实现范围
+
+已参考论文配套实现：
+- 2-stage-now/dataset.py 中的 HEEWDailyStage1Dataset；
+- 2-stage-now/configs/train_stage1.yaml、train_stage2.yaml；
+- 2-stages/README.md、dataset_stage2.py、model_stage2.py。
+
+对齐内容包括：四个目标通道及顺序、条件通道、完整 24 小时样本、
+80/10/10 按日时间划分、训练集统计量归一化、条件生成而非历史预测。
+时间编码为 month/dayofyear/weekday/hour 的 sin/cos，共 8 个通道。
+默认 pv11 气象通道为：
+
+Temperature, Dew Point, Humidity, Wind Speed, Wind Gust, Pressure, Precip,
+ALLSKY_SFC_SW_DWN, CLRSKY_SFC_SW_DWN, PV_CLEARNESS_RATIO, PV_IS_DAYLIGHT。
+
+保留本对照实验指定的 DLinear + CSDI，不把论文中的 LCGT/PCMCI 等完整
+第一阶段或 center/scale/factor 第二阶段搬入此基线。本分支的目的仍是
+检验两阶段残差化对共享总扩散步数的影响，不是复现论文全部架构。
+
+## 两组模型实际读取什么
+
+令 C 为 [24,19] 的天气和日历条件，Y 为 [24,4] 的目标能源曲线。
+
+| 模型 | 条件 | 扩散目标 | 最终样本 |
+| --- | --- | --- | --- |
+| Direct CSDI | C | Y | generated Y |
+| DLinear + Residual CSDI | C 和可选 mu(C) | R=Y-mu(C) | mu(C)+generated R |
+
+DLinear 每个种子训练一次后冻结，各 T 复用。由于原版 DLinear 假定输入
+和输出是同一组时间序列，这里明确采用 **Conditional DLinear 改编**：
+先分解每个外生条件通道的平滑项/剩余项，再做时间线性映射（24→24），
+最后通过可学习的条件通道→四个能源通道线性投影生成基准曲线。
+它不使用历史能源，不能描述为未经改动的原版 DLinear。
+
+两组 CSDI 的网络架构和参数量相同，天气与时间在每个去噪块作为 side
+information 注入，同时保留时间注意力和变量注意力。
+Direct 的第二个辅助输入为零；Residual 默认显式接收冻结的 mu(C)，
+既提供外生条件也提供第一阶段结构。辅助输入不是真实能源观测。
+
+默认 model.condition_on_skeleton=true。改为 false 可进行重要消融：
+残差组仍学习 Y-mu(C)、最终加回 mu(C)，但两组仅接收相同的 C。
+这样可以进一步区分“残差化”和“显式基准曲线引导”的影响。
+此设置改变了实验定义，需使用新输出目录重新训练。
+
+所有扩散目标都使用原能源的训练集尺度。**残差不再次单独标准化**，
+与论文原第二阶段的残差重标准化不同，目的是保留该对照的控制变量。
+如需比较残差重标准化，应另开消融而不能混入主实验。
+没有额外施加非负裁剪或 PV 夜间强制归零，避免后处理改变曲线归因。
+
+## 使用真实论文数据
 
 在仓库根目录，Python 3.10+：
 
 ```bash
 python -m pip install -r requirements-step-study.txt
 python -m unittest discover -s tests -v
-python -m step_study.run --synthetic --smoke --seeds 42 43 \
-  --output step_study_runs/total_T_smoke
-```
 
-合成数据默认包含四个变量。smoke 使用小骨干、单轮训练、T=[10,20,40]，
-仅检查流程；图片明确标注 DEMONSTRATION ONLY，不能作为论文实验结果。
-
-真实数据示例（把 var1 等替换为真实的四个列名）：
-
-```bash
-python -m step_study.run --data data/my_series.csv \
-  --columns var1,var2,var3,var4 \
+python -m step_study.run \
+  --energy-path Data/Total_energy.csv \
+  --weather-path Data/Total_weather.csv \
   --diffusion-steps 10 20 50 100 200 \
   --device cuda:0 --seeds 42 43 44 \
-  --output step_study_runs/four_variables
+  --output step_study_runs/paper_conditioned
 ```
 
-数据须按时间排序、等间隔、无缺失；CSV 需显式指定数值列以排除时间戳。
-也支持 .npy，形状为 [time, variables]，列名自动为 variable_0 等。
-若联合建模的变量多于四个，使用 --columns 指定全部输入列，再用
---plot-variables var1,var2,var3,var4 指定画图的四列；其余变量仍参与联合建模，
-CSV 输出和共享损失统计仍包含全部变量。默认输入不是四列时要求显式选择，
-不会自动挑选结果最好的四个变量。
+两个 CSV 都须包含 Year,Month,Day,Hour，并包含上述目标/条件字段。
+按时间戳连接，允许两张表行序不同；重复或不匹配时间戳直接报错，
+不会像旧配套加载器那样静默截断较长表。丢弃非完整 24 小时的日，
+在 manifest 记录丢弃数量。随后按完整日顺序做 80/10/10 划分；
+目标和天气的均值/标准差只用训练日拟合，标准差加 1e-6。
+日历周期编码不再拟合 scaler。
 
-历史长度、预测长度、训练轮数、样本数等在 config/step_study.yaml 中设置。
-study.diffusion_steps 是扫描列表，命令行 --diffusion-steps 可覆盖它。
-每个 T 和每个种子均训练两套扩散模型，训练成本随 T 配置数增加。
-DLinear 每个种子训练一次并冻结，在全部 T 下复用。
+data.weather_feature_set 支持 pv11（默认）、pv9、base7；
+只有天气列改变，始终保留 8 个日历条件。默认所有四个能源目标联合生成，
+输出顺序为 Electricity,Heat,Cooling,PV，不依赖 CSV 内的列排列顺序。
+--plot-variables 可改变四个子图的显示顺序。
 
-使用相同参数加 --evaluate-only 可加载所有 T 的权重重新评估。
-旧版 DDIM 配置和 checkpoint 不兼容，新入口会明确拒绝混用。
-初次训练拒绝覆盖非空输出目录。
-
-不运行模型、只从保存的 CSV 重画图片：
+快速检查（可以直接使用真实数据路径）：
 
 ```bash
-python -m step_study.plotting --run step_study_runs/four_variables
+python -m step_study.run \
+  --energy-path Data/Total_energy.csv \
+  --weather-path Data/Total_weather.csv \
+  --smoke --seeds 42 --output step_study_runs/paper_smoke
+
+python -m step_study.run --synthetic --smoke --seeds 42 \
+  --output step_study_runs/condition_demo
 ```
 
-该命令可加 --plot-variables 选择其他四个已评估变量。
+smoke 保持 24 小时日样本、19 条件、4 目标、完整日划分和训练 scaler，
+仅缩小模型、训练一轮，并在原 split 内确定性抽取最多 16/4/4 日；
+默认 T=[10,20,40]，4 个生成样本。图片标注 DEMONSTRATION ONLY。
+这用于数据接口和流程测试，不能据其效果得出论文结论。
 
-## 用户要求的图
+使用相同参数加 --evaluate-only 可以重跑保存权重的评估。
+历史预测版本、旧 DDIM 版本的配置与权重不能用于当前入口。
+初次训练不覆盖非空输出目录，数据与配置指纹用于检查评估复现。
+旧 --data/--columns/NumPy 历史预测入口已从主命令移除。
 
-每种图均输出 PNG 和 PDF，变量顺序遵循输入或 --plot-variables。
+无需运行模型、只重画保存的曲线：
 
-| 文件 | 布局与含义 |
+```bash
+python -m step_study.plotting --run step_study_runs/paper_conditioned
+```
+
+## 图与指标
+
+每种图均输出 PNG 和 PDF。每张四变量图为 2×2 子图，
+每格对比 Direct CSDI 和 DLinear + Residual CSDI。
+
+| 文件 | 含义 |
 | --- | --- |
-| ncrps_vs_diffusion_steps_test | 2×2 四变量图；横轴总扩散步数 T，纵轴 nCRPS；每格对比 Direct CSDI 与 DLinear + Residual CSDI |
-| relative_loss_vs_diffusion_steps_test | 2×2 四变量图；横轴 T，纵轴每变量相对损失 r_i(T)，以百分比显示 |
-| ncrps_vs_diffusion_steps_val | 验证集版本 |
+| ncrps_vs_diffusion_steps_test | 测试集横轴 T，纵轴 nCRPS |
+| relative_loss_vs_diffusion_steps_test | 测试集横轴 T，纵轴每变量相对损失百分比 |
+| ncrps_vs_diffusion_steps_val | 验证集 nCRPS 版本 |
 | relative_loss_vs_diffusion_steps_val | 验证集相对损失版本 |
-| shared_step_relative_loss_val | 验证集所有变量平均相对损失随 T 变化的辅助图 |
+| shared_step_relative_loss_val | 验证集四变量平均相对损失 |
 
-横轴为线性数值轴，刻度明确显示实际训练过的 T。曲线是训练种子均值，
-阴影为总体标准差，非置信区间；阴影低于零的部分截至零。
-每个 T 的评分均针对最终完整序列：
-Direct 直接生成 Y；Two-stage 输出 DLinear(history) + 生成残差。
-不对残差自身评分来替代完整序列质量。
+曲线是种子均值，阴影为总体标准差而非置信区间，低于零部分截至零。
+所有评分针对最终完整能源序列，不用残差自身的评分替代。
 
-## nCRPS 的明确口径
+nCRPS_i(T) = sum_j CRPS(F_ij,T,y_ij) / sum_j |y_ij|。
 
-在每个变量 i、每个评估集合内，对所有预测窗口和预测时刻 j：
+j 遍历评估日和小时；分子/分母均在原能源量纲计算。该归一化与原
+CSDI 的目标绝对值口径一致，这里使用精确的经验分布 CRPS，而不是
+原实现的 19 分位点近似。nCRPS 不是 CRPS/training_std，也不乘100。
+某变量的评估目标全为零时 nCRPS 未定义，代码报错。
 
-nCRPS_i(T) = sum_j CRPS(F_ij,T, y_ij) / sum_j |y_ij|。
+r_m,i,s(T) = [M_m,i,s(T)-min_T' M_m,i,s(T')]
+             / [min_T' M_m,i,s(T')+epsilon]，M=nCRPS，epsilon=1e-8。
 
-分子、分母均在原始物理量纲上计算，两个方法和全部 T 共用同一目标分母。
-这与原 CSDI utils.py 的目标绝对值归一化口径一致；这里使用精确的有限
-经验分布 CRPS，而原 CSDI 使用 19 个分位点近似积分，数值不保证完全相同。
-本指标不是上一版的 CRPS / training_std，也没有额外乘 100。
+每个方法、变量、种子、split 分别以自己的最小值为基准，之后跨种子
+计算均值和标准差。测试网格最小值仅作描述性敏感性分析，图中明确标明；
+正式共享 T 和逐变量 T_i* 从验证集选择，再在测试集评价。
 
-经验 CRPS = mean_s |x_s-y| - 0.5 mean_(s,s') |x_s-x_s'|。
-实现通过样本排序精确计算该有限样本表达式。
-归一化分母为零（某变量评估目标全为零）时报错，不把未定义结果画成零。
-nCRPS 对乘法单位换算不变，但对平移不保持不变，因此先还原训练均值。
+summary.json 还保存 std(log T_i*)、2% 近最优区间及其交集、
+共享损失 G=min_T mean_i r_i(T)，以及验证集选择的 T 在测试集上的表现。
+最小 mean(nCRPS) 与最小 mean(relative loss) 的共享 T 分别报告。
 
-## 每变量相对损失
+## 扩散控制
 
-对每个方法 m、变量 i、种子 s、评估集合分别计算：
+使用同一连续 VP 日程 alpha_bar(u)=exp[-b_min*u-
+0.5*(b_max-b_min)*u^2] 在 u=t/T 上离散化，
+beta_t=1-alpha_bar(t/T)/alpha_bar((t-1)/T)。
+默认 b_min=0.1、b_max=20，各 T 的终端 alpha_bar≈4.32e-5。
+时间嵌入使用固定参考尺度 1000*u，以对齐不同 T 的噪声时刻。
 
-r_m,i,s(T) = [M_m,i,s(T) - min_T' M_m,i,s(T')]
-             / [min_T' M_m,i,s(T') + epsilon]，
+每个 T 独立初始化并训练两组扩散网络；骨干参数量、训练更新预算、
+条件编码、配对训练随机数相同。验证噪声损失选择 checkpoint，
+随后固定该权重完整采样 T 步 DDPM，最后一步不加反向噪声。
+初始 Gaussian 跨 T/方法复用，同一 T 两组的反向噪声也配对；
+不宣称不同 T 的中间随机轨迹相同。
 
-其中 M=nCRPS，epsilon 默认为 1e-8。**两种方法各自以自己的最优值为基准**。
-先在每个种子内计算相对损失，再跨种子取均值和标准差。因此图中的平均曲线
-不一定有恰好为零的点（不同种子的最优 T 可能不同）。10% 意味着比该方法、
-该变量、该种子在扫描范围内的最好 nCRPS 高约 10%。
+DLinear 的额外参数/训练成本属于两阶段系统，不计为扩散骨干容量。
+训练残差使用第一阶段样本内输出，过拟合时可另做交叉拟合检查。
 
-测试图使用测试网格最小值，仅作描述性敏感性分析，并在图上标明。
-不据此选择最终部署或报告的最优 T；步数选择使用验证集，随后在测试集评价。
+## 保存内容
 
-summary.json 同时报告验证集逐变量最优 T、std(log T_i*)、2% 近最优区间、
-区间交集和共享损失 G = min_T mean_i r_i(T)。
-最优 mean(nCRPS) 的共享 T 与最小 mean(relative loss) 的 T 分别保存，
-二者可能不同。测试集上另报验证集选出的共享 T 与逐变量 T_i* 的性能差，
-这个测试差值允许为负。
-
-## 控制变量与可复现性
-
-- 两组复用原版 diff_CSDI 时间/变量注意力、相同参数量、历史条件、
-  初始化、训练批次和每个 T 内配对的训练噪声；无变量子采样。
-- 同一连续 VP 日程离散化：alpha_bar(u)=exp[-b_min*u -
-  0.5*(b_max-b_min)*u^2]，u∈[0,1]；beta_t=1-alpha_bar(t/T)/
-  alpha_bar((t-1)/T)。默认 b_min=0.1、b_max=20，
-  各 T 的 terminal alpha_bar 均约 4.32e-5。较小 T 的单步噪声自然更大。
-- 时间嵌入使用同一归一化时间 u（固定参考尺度 1000*u），避免相同整数
-  t 在不同 T 下代表不同噪声水平却使用相同嵌入。
-- 每个 T 均执行完整 ancestral DDPM，用标准后验方差添加反向噪声，
-  最后一步不加噪；恰好 T 次去噪网络调用。
-- 初始 Gaussian 跨 T、跨方法复用；反向噪声使用独立随机流，同一个 T
-  的两组方法逐次配对。不同 T 的链长度不同，不宣称中间随机轨迹相同。
-- 每个 T 使用相同训练更新预算，验证集固定噪声损失选 checkpoint。
-  不复用其他 T 的训练权重。DLinear 选验证集 MSE 最优权重后冻结。
-- 原时间轴按 60/20/20 划分；目标窗口不跨 split，历史可使用先前已知
-  观测（rolling-origin）。归一化仅拟合训练数据，残差不另行标准化。
-- DLinear 增加整体参数量和训练成本，只有扩散骨干容量相同。训练残差
-  使用 DLinear 的样本内预测；若第一阶段过拟合，需要另做交叉拟合检查。
-
-## 其他输出
-
-- manifest.json：实验类型、配置、数据指纹、scaler、种子、变量、运行环境。
-- seed_*/dlinear.pt：每个种子唯一的第一阶段权重。
-- seed_*/T_*/direct.pt、residual.pt：每个 T 独立训练的权重。
-- seed_*/T_*/diffusion_config.json：T、日程、终端 alpha_bar 与采样器。
+- manifest.json：任务类型、条件列、目标列、日划分、实际评估日期、
+  数据指纹、scaler、配置、种子与环境。
+- seed_*/dlinear.pt：条件 DLinear 权重，每个种子一份。
+- seed_*/T_*/direct.pt、residual.pt：每个 T 独立的扩散模型权重。
+- seed_*/T_*/diffusion_config.json：T、日程、终端 alpha_bar。
 - *.history.json：训练及验证损失。
-- per_variable.csv：nCRPS、原尺度 CRPS、标准化 CRPS/RMSE、归一化分母、
-  diffusion_steps 和 sampling_steps（均为 T）。
-- per_variable_relative_loss.csv：逐变量/方法/种子/T 的相对损失及参考最优值。
-- joint_scores.csv：联合轨迹 energy score 和采样耗时（残差组包含 DLinear）。
-- summary.json：最优 T、共享损失、近最优区间等。
-- plot_metadata.json：画图变量、轴含义、聚合方式和是否为示范数据。
+- per_variable.csv：nCRPS、原尺度 CRPS、标准化 CRPS/RMSE、归一化分母。
+- per_variable_relative_loss.csv：每变量/方法/种子/T 的相对损失及参考最优值。
+- joint_scores.csv：联合轨迹 energy score、采样耗时（残差组含 DLinear）。
+- summary.json、plot_metadata.json：步数诊断和绘图元信息。
 
-更平坦的曲线及更低的相对损失支持“共享总步数的折中减小”，但单独不能
-证明生成难度异质性下降：残差幅值与第一阶段占比也会影响曲线。
-需结合绝对 nCRPS、联合指标、多种子结果及适当消融解释。
-
-## 参考
-
-- [CSDI](https://github.com/ermongroup/CSDI)：复用本仓库去噪骨干。
-- [DLinear / LTSF-Linear](https://github.com/cure-lab/LTSF-Linear)：趋势/季节分解加线性预测设计。
-- [DDPM](https://arxiv.org/abs/2006.11239)：完整反向采样过程。
+原始能源与天气数据不包含在分支中。较低共享损失支持“共享总步数折中
+减小”，但不能单独证明生成难度异质性下降；需结合绝对生成质量、联合
+指标和上述消融解释。
