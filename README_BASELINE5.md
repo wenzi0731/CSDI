@@ -184,10 +184,15 @@ done
 
 同一个96维标准化向量上，`p=0.5`：
 
-`VS_d = (1/M)*sum_{i<j} (|y_i-y_j|^p - (1/S)*sum_s |x_si-x_sj|^p)^2`，
-其中 `M=96*95/2=4560`，所有无序维度对等权，权重总和1。
-覆盖跨时间和跨通道的维度对；输出逐日平均，`VS` 与 `VS_Z` 同义。
-有些论文不除以M，或对有序对求和，数值不可直接对照。这里把约定显式固定。
+`VS_d = sum_{i<j} w_ij * (|y_i-y_j|^p - (1/S)*sum_s |x_si-x_sj|^p)^2`。
+按论文定义：i、j属于不同源荷变量时 `w_ij=1`，属于同一变量时 `w_ij=0`。
+只计算跨源荷变量配对，包含同时刻及不同时刻，每个无序对仅计算一次。
+四通道24小时对应 `C(4,2)*24^2=3456` 个正权重配对。
+**对配对求和，不除以配对数**；最后对测试日取平均，`VS` 与 `VS_Z` 同义。
+输出记录 `VS_definition=cross_channel_unit_weights_v1` 和 `VS_pair_count=3456`，用于识别评分版本。
+
+注意：旧版使用全部4560个分量对的平均值，包含同变量的时间配对。
+旧、新VS不能混用，也不能仅乘一个常数转换。需从已保存场景重算；训练、选参、ES及其他指标不受此修改影响。
 
 保留原有 MAE/RMSE、MAE_Z/RMSE_Z、CRPS/nCRPS、Precision_Z/Recall_Z、CR/IW。
 `mean_nCRPS` 是所有通道混合后的比值，`macro_nCRPS` 是四个通道比值的平均；选参用后者。
@@ -207,6 +212,17 @@ python -m baseline5.score_npz \
   --npz /absolute/path/to/baseline4_scenarios.npz \
   --outdir results/baseline5/rescore_baseline4_seed42 --seed 42
 ```
+
+已有CSDI测试结果也可直接补算论文版VS，无需重新训练或采样：
+
+```bash
+python -m baseline5.score_npz \
+  --npz experiments/baseline5/csdi_final_seed42/evaluation_test/baseline5_scenarios.npz \
+  --outdir experiments/baseline5/csdi_final_seed42/evaluation_test_vs_paper --seed 42
+```
+
+该命令写入新的 `global_metrics.csv/json`、`daily_scores.csv` 和 `metric_definitions.json`，不覆盖旧结果或图片。
+其他种子请同时替换路径中的seed和 `--seed` 值。其他模型也应使用同一论文版VS定义重算。
 
 必须包含 `scenarios [N,S,4,24]`、`targets [N,4,24]`、`dates`、`target_mean`、`target_std`。
 输入必须是已经完成一致后处理的物理单位数据，通道顺序严格为电/热/冷/PV，统计量来自训练集。

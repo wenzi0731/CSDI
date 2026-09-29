@@ -168,7 +168,9 @@ def joint_scores(samples, target, target_mean, target_std, p=0.5):
     """Per-day ES and VS for channel-major 96-D standardized trajectories.
 
     ES uses the empirical distribution (S**2 denominator, diagonal included).
-    VS uses p=0.5 and uniform weights summing to 1 over unordered i<j pairs.
+    Paper VS uses p=0.5, weight 1 for cross-channel unordered i<j pairs and
+    weight 0 within a channel. Sum over pairs (no pair-count normalization).
+    Includes both same-hour and different-hour cross-channel pairs.
     These conventions must be identical across every compared baseline.
     """
     from scipy.spatial.distance import pdist
@@ -186,6 +188,9 @@ def joint_scores(samples, target, target_mean, target_std, p=0.5):
     x = ((values - mean[None, None, :, None]) / std[None, None, :, None]).reshape(len(values), values.shape[1], -1)
     y = ((truth - mean[None, :, None]) / std[None, :, None]).reshape(len(truth), -1)
     left, right = np.triu_indices(x.shape[-1], k=1)
+    # Flattening is channel-major: channel index = flattened index // hours.
+    cross_channel = left // values.shape[-1] != right // values.shape[-1]
+    left, right = left[cross_channel], right[cross_channel]
     es, vs = [], []
     for ensembles, observation in zip(x, y):
         # pdist stores each unordered pair once; equal to half the ordered sum.
@@ -193,7 +198,7 @@ def joint_scores(samples, target, target_mean, target_std, p=0.5):
                   - pdist(ensembles, metric="euclidean").sum() / len(ensembles) ** 2)
         expected_difference = np.abs(ensembles[:, left] - ensembles[:, right]) ** p
         observed_difference = np.abs(observation[left] - observation[right]) ** p
-        vs.append(np.mean((observed_difference - expected_difference.mean(axis=0)) ** 2))
+        vs.append(np.sum((observed_difference - expected_difference.mean(axis=0)) ** 2))
     return np.asarray(es), np.asarray(vs)
 
 
@@ -205,6 +210,8 @@ def save_additional_scores(samples, target, mean, std, dates, labels, output_dir
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
     es, vs = joint_scores(samples, target, mean, std)
+    vs_definition = "cross_channel_unit_weights_v1"
+    vs_pair_count = int(target.shape[1] * (target.shape[1] - 1) // 2 * target.shape[2] ** 2)
     scores = crps_map(samples, target)
     lo, hi = np.quantile(samples, [0.025, 0.975], axis=1)
     intervals = interval_score(target, lo, hi)
@@ -229,15 +236,20 @@ def save_additional_scores(samples, target, mean, std, dates, labels, output_dir
         "joint_layout": "channel-major: Electricity, Heat, Cooling, PV; hours 0..23",
         "joint_normalization": "training-set per-channel z-score; after PV physical clipping",
         "ES": "alias ES_Z; mean_s ||x_s-y|| - sum_{s,r} ||x_s-x_r||/(2*S^2)",
-        "VS": "alias VS_Z; mean_{i<j} (abs(y_i-y_j)^p - mean_s abs(x_si-x_sj)^p)^2",
-        "VS_p": 0.5, "VS_weights": "uniform unordered pairs, sum=1",
+        "VS": "alias VS_Z; mean_d sum_{i<j, channel(i)!=channel(j)} (abs(y_di-y_dj)^p - mean_s abs(x_dsi-x_dsj)^p)^2",
+        "VS_p": 0.5,
+        "VS_definition": vs_definition,
+        "VS_weights": "1 across channels, 0 within channel; no pair-count normalization",
+        "VS_pair_count": vs_pair_count,
+        "VS_pair_scope": "all same-hour and different-hour cross-channel pairs, each unordered pair once",
         "direction": "R2 higher is better; IS, ES, VS lower is better",
         "ensemble_estimator": "empirical distribution (not ensemble-size bias-corrected/fair score)",
         "precision_recall": "legacy nearest-center-radius approximation, not full kNN-ball union",
     }
     (destination / "metric_definitions.json").write_text(json.dumps(definition, indent=2))
     return {"ES": float(es.mean()), "ES_Z": float(es.mean()),
-            "VS": float(vs.mean()), "VS_Z": float(vs.mean())}
+            "VS": float(vs.mean()), "VS_Z": float(vs.mean()),
+            "VS_definition": vs_definition, "VS_pair_count": vs_pair_count}
 
 
 def compute_global_pearson_matrix(total_data: np.ndarray) -> np.ndarray:
