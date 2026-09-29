@@ -1,9 +1,11 @@
 # CSDI
-## Direct vs residual diffusion: sampling-step study
+## Direct vs residual diffusion: total diffusion-step study
 
 See [STEP_STUDY.md](STEP_STUDY.md) for the matched Direct CSDI versus
-DLinear + Residual CSDI experiment, data format, training commands, per-variable
-Performance–Step curves, and validation-selected shared-step diagnostics.
+DLinear + Residual CSDI experiment. A fresh model pair is trained at each total
+diffusion step count T and sampled with a full T-step DDPM chain. Outputs include
+four-variable (2×2) nCRPS–T panels and per-variable relative-loss comparison panels,
+plus validation-selected shared-step diagnostics. [运行与指标说明](STEP_STUDY.md).
 
 This is the github repository for the NeurIPS 2021 paper "[CSDI: Conditional Score-based Diffusion Models for Probabilistic Time Series Imputation](https://arxiv.org/abs/2107.03502)".
 

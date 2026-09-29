@@ -51,12 +51,21 @@ class ForecastCSDI(CSDI_base):
         diff = config["diffusion"]
         if config["model"]["is_unconditional"]:
             raise ValueError("The step study requires history-conditioned diffusion")
-        if diff["schedule"] not in ("linear", "quad") or not 0 < diff["beta_start"] <= diff["beta_end"] < 1:
+        if diff["schedule"] != "vp_continuous" and (diff["schedule"] not in ("linear", "quad") or not 0 < diff["beta_start"] <= diff["beta_end"] < 1):
             raise ValueError("Use a linear/quad schedule with 0 < beta_start <= beta_end < 1")
         if diff["num_steps"] < 2:
             raise ValueError("At least two training diffusion steps are required")
         super().__init__(variables, copy.deepcopy(config), device)
         self.register_buffer("alpha_bar", torch.tensor(self.alpha, dtype=torch.float32))
+        self.register_buffer("betas", torch.tensor(self.beta, dtype=torch.float32))
+        if diff["schedule"] == "vp_continuous":
+            # Encode the same normalized time with the same features across T.
+            embedding = self.diffmodel.diffusion_embedding
+            dim = diff["diffusion_embedding_dim"] // 2
+            u = torch.arange(1, self.num_steps + 1, dtype=torch.float32) / self.num_steps
+            frequencies = 10.0 ** (torch.arange(dim) / (dim - 1) * 4.0)
+            phase = (1000 * u[:, None]) * frequencies[None, :]
+            embedding.embedding = torch.cat([phase.sin(), phase.cos()], dim=1)
 
     def context(self, history, horizon):
         b, length, variables = history.shape
@@ -82,7 +91,7 @@ class ForecastCSDI(CSDI_base):
         return F.mse_loss(predicted, noise)
 
     @torch.no_grad()
-    def sample(self, history, initial_noise, steps):
+    def sample_ddim(self, history, initial_noise, steps):
         """DDIM eta=0, exactly `steps` NFE, always traversing to clean time.
 
         initial_noise: [batch, samples, horizon, variables]; caller reuses it for
@@ -105,4 +114,29 @@ class ForecastCSDI(CSDI_base):
             noise = self.predict_noise(current, history, context, t)
             clean = (current - (1 - alpha).sqrt() * noise) / alpha.sqrt()
             current = next_alpha.sqrt() * clean + (1 - next_alpha).sqrt() * noise
+        return current.reshape(b, samples, horizon, variables)
+
+    @torch.no_grad()
+    def sample_ddpm(self, history, initial_noise, generator):
+        """Full ancestral DDPM chain: exactly T evaluations, posterior variance.
+
+        Uses a supplied CPU generator for reproducible, paired reverse noise.
+        The initial Gaussian is supplied separately and shared across T and arms.
+        """
+        if self.training:
+            raise RuntimeError("Call eval() before sampling (CSDI contains dropout)")
+        b, samples, horizon, variables = initial_noise.shape
+        history = history.repeat_interleave(samples, dim=0)
+        current = initial_noise.reshape(b * samples, horizon, variables).clone()
+        context = self.context(history, horizon)
+        for time in range(self.num_steps - 1, -1, -1):
+            alpha = self.alpha_bar[time]
+            beta = self.betas[time]
+            t = torch.full((len(history),), time, device=history.device, dtype=torch.long)
+            predicted = self.predict_noise(current, history, context, t)
+            current = (current - beta / (1 - alpha).sqrt() * predicted) / (1 - beta).sqrt()
+            if time > 0:
+                variance = beta * (1 - self.alpha_bar[time - 1]) / (1 - alpha)
+                noise = torch.randn(current.shape, generator=generator, dtype=current.dtype).to(current.device)
+                current = current + variance.sqrt() * noise
         return current.reshape(b, samples, horizon, variables)

@@ -38,6 +38,19 @@ class CSDI_base(nn.Module):
             self.beta = np.linspace(
                 config_diff["beta_start"], config_diff["beta_end"], self.num_steps
             )
+        elif config_diff["schedule"] == "vp_continuous":
+            # Discretize a fixed continuous VP schedule, preserving alpha_bar(1)
+            # across total-step experiments instead of reusing per-step betas.
+            lower, upper = config_diff["beta_min"], config_diff["beta_max"]
+            if not 0 < lower <= upper or not np.isfinite([lower, upper]).all():
+                raise ValueError("Require finite 0 < beta_min <= beta_max")
+            u = np.linspace(0.0, 1.0, self.num_steps + 1)
+            log_alpha = -lower * u - 0.5 * (upper - lower) * u ** 2
+            self.beta = -np.expm1(np.diff(log_alpha))
+            if np.any(self.beta >= 1) or np.any(self.beta <= 0):
+                raise ValueError("Schedule discretization requires 0 < beta_t < 1")
+        else:
+            raise ValueError("Unsupported diffusion schedule")
 
         self.alpha_hat = 1 - self.beta
         self.alpha = np.cumprod(self.alpha_hat)

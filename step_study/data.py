@@ -8,7 +8,7 @@ import torch
 from torch.utils.data import Dataset
 
 
-def synthetic_series(length=600, variables=3, seed=31415):
+def synthetic_series(length=600, variables=4, seed=31415):
     rng = np.random.default_rng(seed)
     t = np.arange(length)
     common = rng.normal(size=length)
@@ -29,7 +29,7 @@ def load_series(path, columns=None):
             reader = csv.DictReader(file)
             if not columns:
                 raise ValueError("CSV input requires --columns: explicitly exclude timestamp/ID fields")
-            names = columns.split(",")
+            names = [name.strip() for name in columns.split(",")]
             if not set(names).issubset(reader.fieldnames or []):
                 raise ValueError(f"Missing requested columns: {names}")
             values = np.asarray([[float(row[name]) for name in names] for row in reader], dtype=np.float32)
