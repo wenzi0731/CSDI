@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from linear_attention_transformer import LinearAttentionTransformer
 
 
 def get_torch_trans(heads=8, layers=1, channels=64):
@@ -12,6 +11,7 @@ def get_torch_trans(heads=8, layers=1, channels=64):
     return nn.TransformerEncoder(encoder_layer, num_layers=layers)
 
 def get_linear_trans(heads=8,layers=1,channels=64,localheads=0,localwindow=0):
+  from linear_attention_transformer import LinearAttentionTransformer
 
   return LinearAttentionTransformer(
         dim = channels,

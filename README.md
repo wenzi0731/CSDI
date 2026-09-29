@@ -1,4 +1,10 @@
 # CSDI
+## Direct vs residual diffusion: sampling-step study
+
+See [STEP_STUDY.md](STEP_STUDY.md) for the matched Direct CSDI versus
+DLinear + Residual CSDI experiment, data format, training commands, per-variable
+Performance–Step curves, and validation-selected shared-step diagnostics.
+
 This is the github repository for the NeurIPS 2021 paper "[CSDI: Conditional Score-based Diffusion Models for Probabilistic Time Series Imputation](https://arxiv.org/abs/2107.03502)".
 
 ## Requirement
